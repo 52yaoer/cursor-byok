@@ -23,6 +23,7 @@ export type CursorModelDraft = {
 export const emptyCursorModelDraft = (): CursorModelDraft => ({
   providerId: "builtin/openai",
   model: {
+    enabled: true,
     sort_order: 0,
     display_name: "",
     group_name: null,

@@ -29,6 +29,7 @@ use tower::ServiceExt;
 
 fn model_input() -> ModelConfigInput {
     ModelConfigInput {
+        enabled: true,
         sort_order: 0,
         display_name: "Example".into(),
         group_name: Some("work".into()),
@@ -233,6 +234,139 @@ async fn responses_accept_the_configured_model_id_without_a_group() {
         .unwrap()
         .iter()
         .any(|model| model["id"] == "gpt-6.1-sol"));
+}
+
+#[tokio::test]
+async fn disabled_models_are_excluded_until_reenabled() {
+    let (router, provider, store, _directory) = setup().await;
+    let first = store.models().await.unwrap().remove(0);
+    let mut duplicate = model_input();
+    duplicate.sort_order = 1;
+    duplicate.base_url = "https://backup.example.com/v1".into();
+    let second = store.create_model(&duplicate).await.unwrap();
+    store
+        .set_external_api_settings(ExternalApiSettings {
+            enabled: true,
+            api_key: "secret".into(),
+        })
+        .await
+        .unwrap();
+
+    let mut update = serde_json::to_value(&first).unwrap();
+    for (enabled, candidates) in [
+        (false, vec![&second.model_hash, &second.model_hash]),
+        (true, vec![&first.model_hash, &second.model_hash]),
+    ] {
+        update["enabled"] = json!(enabled);
+        let (status, body) = send(
+            router.clone(),
+            "PUT",
+            &format!("/__byok-api__/api/models/{}", first.model_hash),
+            None,
+            update.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["enabled"],
+            enabled
+        );
+        for expected in candidates {
+            provider.push(vec![
+                ModelEvent::TextDelta("ok".into()),
+                ModelEvent::Done(FinishReason::Stop),
+            ]);
+            let (status, body) = send(
+                router.clone(),
+                "POST",
+                "/byok/v1/responses",
+                Some("secret"),
+                json!({"model":first.model_id,"input":"hello"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                &provider.requests().last().unwrap().model.model_id,
+                expected
+            );
+        }
+    }
+
+    for model in [&first, &second] {
+        let mut update = serde_json::to_value(model).unwrap();
+        update["enabled"] = json!(false);
+        assert_eq!(
+            send(
+                router.clone(),
+                "PUT",
+                &format!("/__byok-api__/api/models/{}", model.model_hash),
+                None,
+                update
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    let (_, body) = send(
+        router.clone(),
+        "GET",
+        "/byok/v1/models",
+        Some("secret"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["data"],
+        json!([])
+    );
+    for (path, body) in [
+        (
+            "/byok/v1/responses",
+            json!({"model":first.model_id,"input":"hello"}),
+        ),
+        (
+            "/byok/v1/chat/completions",
+            json!({"model":first.model_id,"messages":[]}),
+        ),
+        (
+            "/byok/v1/messages",
+            json!({"model":first.model_id,"messages":[],"max_tokens":32}),
+        ),
+    ] {
+        assert_eq!(
+            send(router.clone(), "POST", path, Some("secret"), body)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert_eq!(store.models().await.unwrap().len(), 2);
+    assert_eq!(provider.requests().len(), 4);
+    provider.push(vec![
+        ModelEvent::TextDelta("1 2 3".into()),
+        ModelEvent::Done(FinishReason::Stop),
+    ]);
+    let (status, body) = send(
+        router,
+        "POST",
+        &format!(
+            "/__byok-api__/api/models/{}/test/disabled-test",
+            first.model_hash
+        ),
+        None,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !store
+            .model(&first.model_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
 }
 
 #[tokio::test]

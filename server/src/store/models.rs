@@ -11,7 +11,7 @@ use crate::{
 use super::{now_ms, Store};
 
 const MODEL_COLUMNS: &str = r#"
-    model_hash, sort_order, display_name, group_name, model_type, base_url, use_full_url, api_key, tooltip_data,
+    model_hash, enabled, sort_order, display_name, group_name, model_type, base_url, use_full_url, api_key, tooltip_data,
     model_id, reasoning_effort, openai_endpoint, openai_extra_params_enabled,
     openai_extra_params_json, custom_headers_enabled, custom_headers_json,
     anthropic_extra_params_enabled, anthropic_extra_params_json, context_window_tokens,
@@ -39,6 +39,18 @@ impl Store {
             .await?
             .map(model_from_row)
             .transpose()
+    }
+
+    pub async fn enabled_models(&self) -> Result<Vec<ModelConfig>> {
+        let query = format!(
+            "SELECT {MODEL_COLUMNS} FROM model_configs WHERE enabled = 1 ORDER BY sort_order, display_name"
+        );
+        sqlx::query(&query)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(model_from_row)
+            .collect()
     }
 
     pub async fn create_model(&self, input: &ModelConfigInput) -> Result<ModelConfig> {
@@ -123,7 +135,7 @@ impl Store {
         }
         let result = sqlx::query(
             r#"UPDATE model_configs SET
-                model_hash = ?, sort_order = ?, display_name = ?, group_name = ?, model_type = ?, base_url = ?,
+                model_hash = ?, enabled = ?, sort_order = ?, display_name = ?, group_name = ?, model_type = ?, base_url = ?,
                 use_full_url = ?, api_key = ?, tooltip_data = ?, model_id = ?, reasoning_effort = ?,
                 openai_endpoint = ?, openai_extra_params_enabled = ?, openai_extra_params_json = ?,
                 custom_headers_enabled = ?, custom_headers_json = ?,
@@ -133,6 +145,7 @@ impl Store {
             WHERE model_hash = ?"#,
         )
         .bind(&next_hash)
+        .bind(input.enabled)
         .bind(input.sort_order)
         .bind(&input.display_name)
         .bind(&input.group_name)
@@ -243,19 +256,20 @@ async fn insert_model_with_conflict(
 ) -> Result<bool> {
     let mut statement = String::from(
         r#"INSERT INTO model_configs(
-            model_hash, sort_order, display_name, group_name, model_type, base_url, use_full_url, api_key, tooltip_data,
+            model_hash, enabled, sort_order, display_name, group_name, model_type, base_url, use_full_url, api_key, tooltip_data,
             model_id, reasoning_effort, openai_endpoint, openai_extra_params_enabled,
             openai_extra_params_json, custom_headers_enabled, custom_headers_json,
             anthropic_extra_params_enabled, anthropic_extra_params_json, context_window_tokens,
             max_completion_tokens, anthropic_max_tokens, anthropic_thinking_effort,
             thinking_budget_tokens, created_at_ms, updated_at_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     );
     if ignore_existing {
         statement.push_str(" ON CONFLICT(model_hash) DO NOTHING");
     }
     let result = sqlx::query(&statement)
         .bind(hash)
+        .bind(input.enabled)
         .bind(input.sort_order)
         .bind(&input.display_name)
         .bind(&input.group_name)
@@ -287,6 +301,7 @@ async fn insert_model_with_conflict(
 
 fn model_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ModelConfig> {
     Ok(ModelConfig {
+        enabled: row.try_get("enabled")?,
         model_hash: row.try_get("model_hash")?,
         sort_order: row.try_get("sort_order")?,
         display_name: row.try_get("display_name")?,
@@ -341,6 +356,7 @@ mod tests {
 
     fn model_input(group_name: Option<&str>) -> ModelConfigInput {
         ModelConfigInput {
+            enabled: true,
             sort_order: 0,
             display_name: "Test Model".into(),
             group_name: group_name.map(String::from),
@@ -364,6 +380,39 @@ mod tests {
             anthropic_thinking_effort: None,
             thinking_budget_tokens: None,
         }
+    }
+
+    #[tokio::test]
+    async fn enabled_state_survives_updates_and_reopening_without_changing_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", directory.path().join("test.db").display());
+        let store = Store::connect(&url).await.unwrap();
+        let created = store.create_model(&model_input(None)).await.unwrap();
+        assert!(created.enabled);
+        let mut disabled_input = model_input(None);
+        disabled_input.enabled = false;
+        let disabled = store
+            .update_model(&created.model_hash, &disabled_input)
+            .await
+            .unwrap();
+        assert_eq!(disabled.model_hash, created.model_hash);
+        assert!(!disabled.enabled);
+        assert!(store.enabled_models().await.unwrap().is_empty());
+        drop(store);
+        let store = Store::connect(&url).await.unwrap();
+        let loaded = store.model(&created.model_hash).await.unwrap().unwrap();
+        assert!(!loaded.enabled);
+        disabled_input.model_id = "disabled-created".into();
+        assert!(!store.create_model(&disabled_input).await.unwrap().enabled);
+        assert!(store.enabled_models().await.unwrap().is_empty());
+        let enabled = store
+            .update_model(&created.model_hash, &model_input(None))
+            .await
+            .unwrap();
+        assert_eq!(enabled.model_hash, created.model_hash);
+        assert!(enabled.enabled);
+        assert_eq!(store.enabled_models().await.unwrap().len(), 1);
+        assert_eq!(store.models().await.unwrap().len(), 2);
     }
 
     /// 分组名是纯展示字段:入库时去除首尾空白、空串归一为 NULL,

@@ -199,6 +199,7 @@ function createModel({ hash, order, name, type, url, modelId, endpoint = "/v1/re
 }): Model {
   return {
     model_hash: hash,
+    enabled: true,
     sort_order: order,
     display_name: name,
     group_name: null,

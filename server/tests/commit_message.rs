@@ -41,6 +41,7 @@ async fn commit_router(
 
 fn model_input(model_id: &str) -> ModelConfigInput {
     ModelConfigInput {
+        enabled: true,
         sort_order: 1,
         display_name: "Qwen Flash".into(),
         group_name: None,
@@ -88,6 +89,66 @@ fn diff_request(diff: &str) -> ai::WriteGitCommitMessageRequest {
         previous_commit_messages: vec!["feat: 上一次提交".into()],
         explicit_context: None,
     }
+}
+
+#[tokio::test]
+async fn default_model_ignores_disabled_configurations() {
+    use cursor_server::cursor::protocol::proto::agent::v1::GetDefaultModelForCliResponse;
+    use prost::Message;
+
+    let (_directory, store) = fixtures::temp_store().await;
+    let first = store
+        .create_model(&model_input("first-model"))
+        .await
+        .unwrap();
+    let mut second = model_input("second-model");
+    second.sort_order = 2;
+    let second = store.create_model(&second).await.unwrap();
+    let mut value = serde_json::to_value(&first).unwrap();
+    value["enabled"] = serde_json::json!(false);
+    store
+        .update_model(&first.model_hash, &serde_json::from_value(value).unwrap())
+        .await
+        .unwrap();
+    let router = commit_router(store, fake_provider::FakeProvider::default()).await;
+    let response = router
+        .oneshot(
+            Request::post("/agent.v1.AgentService/GetDefaultModelForCli")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let response = GetDefaultModelForCliResponse::decode(body).unwrap();
+    assert_eq!(response.model.unwrap().model_id, second.model_hash);
+}
+
+#[tokio::test]
+async fn disabled_model_is_rejected_without_invoking_provider() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let mut value = serde_json::to_value(model_input("disabled-model")).unwrap();
+    value["enabled"] = serde_json::json!(false);
+    let input = serde_json::from_value(value).unwrap();
+    let created = store.create_model(&input).await.unwrap();
+    store
+        .set_commit_settings(CommitSettings {
+            model_id: created.model_hash,
+            prompt: String::new(),
+            prompt_locale: CommitPromptLocale::ZhCn,
+        })
+        .await
+        .unwrap();
+    let provider = fake_provider::FakeProvider::default();
+    provider.push(vec![
+        ModelEvent::TextDelta("feat: test".into()),
+        ModelEvent::Done(FinishReason::Stop),
+    ]);
+    let router = commit_router(store, provider.clone()).await;
+    let response = post_commit_message(router, diff_request("+change")).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(provider.requests().is_empty());
 }
 
 #[tokio::test]

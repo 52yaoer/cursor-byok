@@ -156,6 +156,7 @@ fn model_input(model: LegacyModel) -> Result<ModelConfigInput> {
     let (base_url, openai_endpoint, use_full_url) =
         legacy_request_configuration(model_type, &model.base_url, &model.openai_endpoint)?;
     Ok(ModelConfigInput {
+        enabled: true,
         sort_order: model.sort,
         display_name: model.display_name.clone(),
         group_name: None,

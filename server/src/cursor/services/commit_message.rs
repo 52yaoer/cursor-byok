@@ -116,10 +116,19 @@ async fn ensure_configured_model(registry: &TransportRegistry, model_id: &str) -
         let plugins = registry.plugins().ok_or_else(|| {
             Error::Provider(format!("commit plugin model {model_id} is unavailable"))
         })?;
-        plugins.model_descriptor(model_id).await?;
-        return Ok(());
+        if plugins.model_descriptor(model_id).await?.enabled {
+            return Ok(());
+        }
+        return Err(Error::Provider(format!(
+            "commit model {model_id} is disabled"
+        )));
     }
-    if registry.store().model(model_id).await?.is_some() {
+    if registry
+        .store()
+        .model(model_id)
+        .await?
+        .is_some_and(|model| model.enabled)
+    {
         return Ok(());
     }
     Err(Error::Provider(format!(

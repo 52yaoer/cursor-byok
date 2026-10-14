@@ -60,6 +60,7 @@ export function CommitSettingsCard() {
     const seen = new Set<string>();
     for (const model of models) {
       seen.add(model.model_hash);
+      if (!model.enabled) continue;
       options.push({
         value: model.model_hash,
         label: model.display_name && model.display_name !== model.model_id
@@ -73,8 +74,9 @@ export function CommitSettingsCard() {
       for (const provider of plugin.providers) {
         if (!provider.configured) continue;
         const group = pluginText(provider.displayName, locale) || plugin.name;
-        for (const model of provider.models.filter((model) => model.enabled)) {
+        for (const model of provider.models) {
           seen.add(model.id);
+          if (!model.enabled) continue;
           options.push({
             value: model.id,
             label: model.displayName,

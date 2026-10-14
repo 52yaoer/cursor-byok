@@ -40,7 +40,7 @@ impl ModelRotation {
 
 pub(super) async fn list(store: &Store, plugins: &PluginRegistry) -> Result<Vec<ListedModel>> {
     let mut models = Vec::new();
-    let mut configured = store.models().await?;
+    let mut configured = store.enabled_models().await?;
     configured.sort_by(|left, right| {
         left.sort_order
             .cmp(&right.sort_order)

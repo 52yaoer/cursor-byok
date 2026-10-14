@@ -84,6 +84,7 @@ impl FromStr for ModelType {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ModelConfigInput {
+    pub enabled: bool,
     #[serde(default)]
     pub sort_order: i64,
     pub display_name: String,
@@ -124,6 +125,7 @@ pub struct ModelConfigInput {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelConfig {
+    pub enabled: bool,
     pub model_hash: String,
     pub sort_order: i64,
     pub display_name: String,
@@ -238,6 +240,7 @@ pub fn normalize_model_input(input: &ModelConfigInput) -> Result<ModelConfigInpu
     validate_headers(&input.custom_headers)?;
 
     let normalized = ModelConfigInput {
+        enabled: input.enabled,
         sort_order: input.sort_order.max(0),
         display_name,
         group_name,

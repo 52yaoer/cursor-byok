@@ -4,6 +4,7 @@ import type { CommitPromptLocale, Locale } from "../i18n/runtime";
 export type ModelType = "openai" | "anthropic";
 
 export interface Model {
+  enabled: boolean;
   model_hash: string;
   sort_order: number;
   display_name: string;
@@ -32,6 +33,7 @@ export interface Model {
 }
 
 export interface ModelInput {
+  enabled: boolean;
   sort_order: number;
   display_name: string;
   group_name: string | null;
@@ -344,7 +346,7 @@ export interface PluginImportResult {
 
 export function configuredPluginModels(plugins: PluginDescriptor[]): PluginModelDescriptor[] {
   return plugins.flatMap((plugin) =>
-    plugin.providers.flatMap((provider) => provider.configured ? provider.models.filter((model) => model.enabled) : []));
+    plugin.providers.flatMap((provider) => provider.configured ? provider.models : []));
 }
 
 export interface OverviewMetrics {

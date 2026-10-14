@@ -251,7 +251,7 @@ pub async fn available_models(
     Extension(proxy): Extension<CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let models = registry.store().models().await?;
+    let models = registry.store().enabled_models().await?;
     let plugin_models = match registry.plugins() {
         Some(plugins) => plugins.configured_models().await,
         None => Vec::new(),
@@ -286,7 +286,7 @@ pub async fn usable_models(
     Extension(proxy): Extension<CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let models = registry.store().models().await?;
+    let models = registry.store().enabled_models().await?;
     let plugin_models = match registry.plugins() {
         Some(plugins) => plugins.configured_models().await,
         None => Vec::new(),
@@ -316,7 +316,7 @@ pub async fn usable_models(
 pub async fn default_model_for_cli(
     State(registry): State<TransportRegistry>,
 ) -> Result<Response<Body>> {
-    let models = registry.store().models().await?;
+    let models = registry.store().enabled_models().await?;
     let plugin_models = configured_plugin_models(&registry).await;
     Ok(local_response(
         agent::GetDefaultModelForCliResponse {
@@ -327,7 +327,7 @@ pub async fn default_model_for_cli(
 }
 
 pub async fn default_model(State(registry): State<TransportRegistry>) -> Result<Response<Body>> {
-    let models = registry.store().models().await?;
+    let models = registry.store().enabled_models().await?;
     let plugin_models = configured_plugin_models(&registry).await;
     Ok(local_response(
         default_model_response(&models, &plugin_models).encode_to_vec(),
@@ -337,7 +337,7 @@ pub async fn default_model(State(registry): State<TransportRegistry>) -> Result<
 pub async fn default_model_nudge(
     State(registry): State<TransportRegistry>,
 ) -> Result<Response<Body>> {
-    let models = registry.store().models().await?;
+    let models = registry.store().enabled_models().await?;
     let plugin_models = configured_plugin_models(&registry).await;
     Ok(local_response(
         default_model_nudge_response(&models, &plugin_models).encode_to_vec(),
@@ -774,6 +774,7 @@ mod tests {
 
     fn model() -> ModelConfig {
         ModelConfig {
+            enabled: true,
             model_hash: "local-model-hash".into(),
             sort_order: 0,
             display_name: "Local Model".into(),

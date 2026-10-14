@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { api, configuredPluginModels, type Model, type ModelInput } from "../../shared/api";
+import { api, configuredPluginModels, type Model, type ModelInput, type PluginModelDescriptor } from "../../shared/api";
 import { CursorCaGate, CursorCaProvider, CursorModelGate, CursorModelProvider } from "./CursorGates";
 import { CursorModelCards, cursorModelGroups, type CursorModelGroup, type CursorModelGrouping } from "./CursorModelCards";
 import { CursorModelEditor, emptyCursorModelDraft, type CursorModelDraft } from "./CursorModelEditor";
@@ -36,6 +36,7 @@ export function CursorSettingsPage() {
   const [modelTestResults, setModelTestResults] = useState<Map<string, CursorModelTestState>>(() => new Map());
   const [savingAndTesting, setSavingAndTesting] = useState(false);
   const [batchTesting, setBatchTesting] = useState(false);
+  const [togglingModelEnabled, setTogglingModelEnabled] = useState(false);
   const [grouping, setGrouping] = useState<CursorModelGrouping>("flat");
   const [settingsGroup, setSettingsGroup] = useState<CursorModelGroup | null>(null);
   const [groupNameDraft, setGroupNameDraft] = useState("");
@@ -258,18 +259,38 @@ export function CursorSettingsPage() {
     }
   }, [message]);
 
+  const setModelEnabled = async (model: Model | PluginModelDescriptor, enabled: boolean) => {
+    setTogglingModelEnabled(true);
+    try {
+      if ("model_hash" in model) {
+        await api.updateModel(model.model_hash, { ...modelInput(model), enabled });
+      } else {
+        await api.setPluginModelEnabled(model.pluginId, model.providerId, model.modelId, enabled);
+      }
+      await appStore.refresh();
+      const { error } = appStore.getSnapshot();
+      if (error) message(error);
+    } catch (cause) {
+      message(errorText(cause));
+    } finally {
+      setTogglingModelEnabled(false);
+    }
+  };
+
   const list = <CursorModelCards
     models={models}
     pluginModels={pluginModels}
     grouping={grouping}
-    disabled={cursorBusy}
+    disabled={cursorBusy || togglingModelEnabled}
     testingModelHashes={testingModelHashes}
     testResults={modelTestResults}
     onTest={(model) => void testModel(model)}
+    onEnabledChange={(model, enabled) => void setModelEnabled(model, enabled)}
     onEdit={openEdit}
     onDuplicate={(model) => void duplicateModel(model)}
     onDelete={setDeleting}
     onTestPluginModel={(model) => void testModel({ model_hash: model.id, display_name: model.displayName })}
+    onPluginEnabledChange={(model, enabled) => void setModelEnabled(model, enabled)}
     onPluginSettings={() => navigate("/plugins")}
     onReorder={reorderModels}
     onGroupSettings={openGroupSettings}
