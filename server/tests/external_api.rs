@@ -186,23 +186,69 @@ async fn disabled_and_unauthorized_requests_cannot_list_models() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         serde_json::from_str::<Value>(&body).unwrap()["data"][0]["id"],
-        "work/qwen/model"
+        "qwen/model"
     );
 }
 
 #[tokio::test]
-async fn duplicate_public_model_ids_use_the_first_configured_model() {
+async fn responses_accept_the_configured_model_id_without_a_group() {
+    let (router, provider, store, _directory) = setup().await;
+    let mut input = model_input();
+    input.group_name = None;
+    input.model_id = "gpt-6.1-sol".into();
+    input.openai_endpoint = OPENAI_RESPONSES_ENDPOINT.into();
+    let model = store.create_model(&input).await.unwrap();
+    store
+        .set_external_api_settings(ExternalApiSettings {
+            enabled: true,
+            api_key: "secret".into(),
+        })
+        .await
+        .unwrap();
+
+    provider.push(vec![
+        ModelEvent::TextDelta("ok".into()),
+        ModelEvent::Done(FinishReason::Stop),
+    ]);
+    let (status, body) = send(
+        router.clone(),
+        "POST",
+        "/byok/v1/responses",
+        Some("secret"),
+        json!({"model":"gpt-6.1-sol","input":"hello"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(provider.requests()[0].model.model_id, model.model_hash);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["model"],
+        "gpt-6.1-sol"
+    );
+
+    let (status, body) = send(router, "GET", "/byok/v1/models", Some("secret"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed = serde_json::from_str::<Value>(&body).unwrap();
+    assert!(listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|model| model["id"] == "gpt-6.1-sol"));
+}
+
+#[tokio::test]
+async fn duplicate_model_ids_rotate_in_configuration_order() {
     let (router, provider, store, _directory) = setup().await;
     let first = store.models().await.unwrap().remove(0);
     let mut duplicate = model_input();
     duplicate.sort_order = 1;
     duplicate.display_name = "Backup".into();
+    duplicate.group_name = Some("backup".into());
     duplicate.base_url = "https://backup.example.com/v1".into();
-    store.create_model(&duplicate).await.unwrap();
+    let second = store.create_model(&duplicate).await.unwrap();
     let mut distinct = model_input();
     distinct.sort_order = 2;
     distinct.model_id = "qwen/other".into();
-    store.create_model(&distinct).await.unwrap();
+    let distinct = store.create_model(&distinct).await.unwrap();
     store
         .set_external_api_settings(ExternalApiSettings {
             enabled: true,
@@ -227,22 +273,109 @@ async fn duplicate_public_model_ids_use_the_first_configured_model() {
         .iter()
         .map(|model| model["id"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(ids, ["work/qwen/model", "work/qwen/other"]);
+    assert_eq!(ids, ["qwen/model", "qwen/other"]);
 
-    provider.push(vec![
-        ModelEvent::TextDelta("ok".into()),
-        ModelEvent::Done(FinishReason::Stop),
-    ]);
-    let (status, body) = send(
-        router,
-        "POST",
-        "/byok/v1/chat/completions",
-        Some("secret"),
-        json!({"model":"work/qwen/model","messages":[{"role":"user","content":"hello"}]}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(provider.requests()[0].model.model_id, first.model_hash);
+    let first = first.model_hash;
+    let second = second.model_hash;
+    for (public_id, expected) in [
+        ("qwen/model", &first),
+        ("qwen/other", &distinct.model_hash),
+        ("qwen/model", &second),
+        ("qwen/model", &first),
+        ("qwen/model", &second),
+    ] {
+        assert_eq!(
+            send(
+                router.clone(),
+                "GET",
+                "/byok/v1/models",
+                Some("secret"),
+                json!({})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                router.clone(),
+                "POST",
+                "/byok/v1/responses",
+                Some("wrong"),
+                json!({"model":public_id,"input":"hello"})
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        provider.push(vec![
+            ModelEvent::TextDelta("ok".into()),
+            ModelEvent::Done(FinishReason::Stop),
+        ]);
+        let (status, body) = send(
+            router.clone(),
+            "POST",
+            "/byok/v1/responses",
+            Some("secret"),
+            json!({"model":public_id,"input":"hello"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            &provider.requests().last().unwrap().model.model_id,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_requests_share_the_model_rotation() {
+    let (router, provider, store, _directory) = setup().await;
+    let first = store.models().await.unwrap().remove(0);
+    let mut duplicate = model_input();
+    duplicate.sort_order = 1;
+    duplicate.base_url = "https://backup.example.com/v1".into();
+    let second = store.create_model(&duplicate).await.unwrap();
+    store
+        .set_external_api_settings(ExternalApiSettings {
+            enabled: true,
+            api_key: "secret".into(),
+        })
+        .await
+        .unwrap();
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..10 {
+        provider.push(vec![
+            ModelEvent::TextDelta("ok".into()),
+            ModelEvent::Done(FinishReason::Stop),
+        ]);
+        let router = router.clone();
+        tasks.spawn(async move {
+            send(
+                router,
+                "POST",
+                "/byok/v1/responses",
+                Some("secret"),
+                json!({"model":"qwen/model","input":"hello"}),
+            )
+            .await
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        let (status, body) = result.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let requests = provider.requests();
+    for hash in [&first.model_hash, &second.model_hash] {
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| &request.model.model_id == hash)
+                .count(),
+            5
+        );
+    }
 }
 
 #[tokio::test]
@@ -258,15 +391,15 @@ async fn all_three_protocols_use_the_public_model_id() {
     for (path, body) in [
         (
             "/byok/v1/chat/completions",
-            json!({"model":"work/qwen/model","messages":[{"role":"user","content":"hello"}]}),
+            json!({"model":"qwen/model","messages":[{"role":"user","content":"hello"}]}),
         ),
         (
             "/byok/v1/responses",
-            json!({"model":"work/qwen/model","input":"hello"}),
+            json!({"model":"qwen/model","input":"hello"}),
         ),
         (
             "/byok/v1/messages",
-            json!({"model":"work/qwen/model","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}),
+            json!({"model":"qwen/model","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}),
         ),
     ] {
         provider.push(vec![
@@ -283,7 +416,7 @@ async fn all_three_protocols_use_the_public_model_id() {
     assert!(provider
         .requests()
         .iter()
-        .all(|request| request.model.model_id != "work/qwen/model"));
+        .all(|request| request.model.model_id != "qwen/model"));
 }
 
 #[tokio::test]
@@ -312,8 +445,14 @@ async fn streaming_chat_returns_incremental_sse_and_tool_calls() {
         ModelEvent::ToolCallEnd { index: 0 },
         ModelEvent::Done(FinishReason::ToolUse),
     ]);
-    let (status, body) = send(router, "POST", "/byok/v1/chat/completions", Some("secret"),
-        json!({"model":"work/qwen/model","stream":true,"messages":[{"role":"user","content":"hello"}]})).await;
+    let (status, body) = send(
+        router,
+        "POST",
+        "/byok/v1/chat/completions",
+        Some("secret"),
+        json!({"model":"qwen/model","stream":true,"messages":[{"role":"user","content":"hello"}]}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("chat.completion.chunk"));
     assert!(body.contains("lookup"));
@@ -335,7 +474,7 @@ async fn chat_tool_result_keeps_the_assistant_function_name() {
         ModelEvent::TextDelta("done".into()),
         ModelEvent::Done(FinishReason::Stop),
     ]);
-    let body = json!({"model":"work/qwen/model","messages":[
+    let body = json!({"model":"qwen/model","messages":[
         {"role":"user","content":"find it"},
         {"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":1}"}}]},
         {"role":"tool","tool_call_id":"call_1","content":"found"}
@@ -372,12 +511,12 @@ async fn responses_and_messages_stream_with_protocol_end_events() {
     for (path, request, terminal) in [
         (
             "/byok/v1/responses",
-            json!({"model":"work/qwen/model","input":"hello","stream":true}),
+            json!({"model":"qwen/model","input":"hello","stream":true}),
             "response.completed",
         ),
         (
             "/byok/v1/messages",
-            json!({"model":"work/qwen/model","max_tokens":100,"messages":[{"role":"user","content":"hello"}],"stream":true}),
+            json!({"model":"qwen/model","max_tokens":100,"messages":[{"role":"user","content":"hello"}],"stream":true}),
             "message_stop",
         ),
     ] {
@@ -422,7 +561,7 @@ async fn responses_stream_emits_complete_text_and_tool_item_lifecycles() {
         "POST",
         "/byok/v1/responses",
         Some("secret"),
-        json!({"model":"work/qwen/model","input":"hello","stream":true}),
+        json!({"model":"qwen/model","input":"hello","stream":true}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -478,7 +617,7 @@ async fn messages_stream_closes_each_content_block_before_stopping() {
         ModelEvent::Done(FinishReason::ToolUse),
     ]);
     let (status, body) = send(router, "POST", "/byok/v1/messages", Some("secret"),
-        json!({"model":"work/qwen/model","max_tokens":100,"messages":[{"role":"user","content":"hello"}],"stream":true})).await;
+        json!({"model":"qwen/model","max_tokens":100,"messages":[{"role":"user","content":"hello"}],"stream":true})).await;
     assert_eq!(status, StatusCode::OK);
     let events = body
         .lines()
@@ -523,21 +662,21 @@ async fn all_protocols_preserve_cached_usage_in_streaming_and_complete_responses
     for (path, request, usage_pointer, cached_pointer, expected_input) in [
         (
             "/byok/v1/chat/completions",
-            json!({"model":"work/qwen/model","messages":[{"role":"user","content":"hello"}]}),
+            json!({"model":"qwen/model","messages":[{"role":"user","content":"hello"}]}),
             "/usage",
             "/prompt_tokens_details/cached_tokens",
             1_000,
         ),
         (
             "/byok/v1/responses",
-            json!({"model":"work/qwen/model","input":"hello"}),
+            json!({"model":"qwen/model","input":"hello"}),
             "/response/usage",
             "/input_tokens_details/cached_tokens",
             1_000,
         ),
         (
             "/byok/v1/messages",
-            json!({"model":"work/qwen/model","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}),
+            json!({"model":"qwen/model","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}),
             "/usage",
             "/cache_read_input_tokens",
             180,
@@ -599,7 +738,12 @@ async fn all_protocols_preserve_cached_usage_in_streaming_and_complete_responses
 #[tokio::test]
 async fn all_entry_and_upstream_protocol_pairs_preserve_cache_usage() {
     let (_directory, store) = fixtures::temp_store().await;
-    store.create_model(&model_input()).await.unwrap();
+    let (_inner_directory, inner_store) = fixtures::temp_store().await;
+    for group in ["bridge-chat", "bridge-responses", "bridge-messages"] {
+        let mut model = model_input();
+        model.model_id = format!("{group}/qwen/model");
+        inner_store.create_model(&model).await.unwrap();
+    }
     store
         .set_external_api_settings(ExternalApiSettings {
             enabled: true,
@@ -607,10 +751,19 @@ async fn all_entry_and_upstream_protocol_pairs_preserve_cache_usage() {
         })
         .await
         .unwrap();
+    inner_store
+        .set_external_api_settings(ExternalApiSettings {
+            enabled: true,
+            api_key: "secret".into(),
+        })
+        .await
+        .unwrap();
     let runtime = PluginRuntime::managed().unwrap();
+    let inner_plugins =
+        PluginRegistry::managed(inner_store.clone(), runtime.clone(), "0.1.0".into()).unwrap();
     let plugins = PluginRegistry::managed(store.clone(), runtime, "0.1.0".into()).unwrap();
     let fake = fake_provider::FakeProvider::default();
-    let inner = byok::router(store.clone(), plugins.clone(), Arc::new(fake.clone()), None);
+    let inner = byok::router(inner_store, inner_plugins, Arc::new(fake.clone()), None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move { axum::serve(listener, inner).await.unwrap() });
@@ -632,7 +785,7 @@ async fn all_entry_and_upstream_protocol_pairs_preserve_cache_usage() {
         model.model_type = model_type;
         model.openai_endpoint = endpoint.into();
         model.base_url = format!("http://127.0.0.1:{port}/byok/v1");
-        model.model_id = "work/qwen/model".into();
+        model.model_id = format!("{group}/qwen/model");
         model.api_key = "secret".into();
         store.create_model(&model).await.unwrap();
     }
@@ -705,7 +858,7 @@ async fn all_entry_and_upstream_protocol_pairs_preserve_cache_usage() {
                     ModelEvent::Done(FinishReason::ToolUse),
                 ]);
                 let mut request = request.clone();
-                request["model"] = json!(format!("{group}/work/qwen/model"));
+                request["model"] = json!(format!("{group}/qwen/model"));
                 request["stream"] = json!(stream);
                 let (status, body) =
                     send(outer.clone(), "POST", path, Some("secret"), request).await;
@@ -750,6 +903,72 @@ async fn all_entry_and_upstream_protocol_pairs_preserve_cache_usage() {
         }
     }
     assert_eq!(fake.requests().len(), 18);
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_responses_rotate_between_same_named_models() {
+    let (_directory, store) = fixtures::temp_store().await;
+    store
+        .set_external_api_settings(ExternalApiSettings {
+            enabled: true,
+            api_key: "secret".into(),
+        })
+        .await
+        .unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let upstream = Router::new().route(
+        "/{channel}/v1/responses",
+        post(
+            move |axum::extract::Path(channel): axum::extract::Path<String>,
+                  Json(body): Json<Value>| {
+                let sender = sender.clone();
+                async move {
+                    sender.send((channel, body)).unwrap();
+                    Json(json!({"object":"response","status":"completed","output":[]}))
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    for (sort_order, channel) in [(0, "first"), (1, "second")] {
+        let mut input = model_input();
+        input.sort_order = sort_order;
+        input.model_id = "gpt-6.1-sol".into();
+        input.openai_endpoint = OPENAI_RESPONSES_ENDPOINT.into();
+        input.base_url = format!("http://127.0.0.1:{port}/{channel}/v1/responses");
+        input.use_full_url = true;
+        store.create_model(&input).await.unwrap();
+    }
+    let runtime = PluginRuntime::managed().unwrap();
+    let plugins = PluginRegistry::managed(store.clone(), runtime, "0.1.0".into()).unwrap();
+    let router = byok::router(
+        store.clone(),
+        plugins,
+        Arc::new(fake_provider::FakeProvider::default()),
+        Some(byok::NativeForwarder::new(
+            store.clone(),
+            NetworkClients::new(store),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )),
+    );
+    for channel in ["first", "second", "first", "second"] {
+        let (status, body) = send(
+            router.clone(),
+            "POST",
+            "/byok/v1/responses",
+            Some("secret"),
+            json!({"model":"gpt-6.1-sol","input":"hello"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (selected, forwarded) = receiver.recv().await.unwrap();
+        assert_eq!(selected, channel);
+        assert_eq!(forwarded["model"], "gpt-6.1-sol");
+    }
     server.abort();
 }
 
@@ -826,11 +1045,11 @@ async fn matching_http_protocols_forward_native_requests_and_responses() {
         model.model_type = model_type;
         model.openai_endpoint = endpoint.into();
         model.base_url = format!("http://127.0.0.1:{port}/byok/v1");
-        model.model_id = "native-model".into();
+        model.model_id = format!("{group}-native-model");
         store.create_model(&model).await.unwrap();
         for stream in [false, true] {
             let mut request = request.clone();
-            request["model"] = json!(format!("{group}/native-model"));
+            request["model"] = json!(model.model_id);
             request["stream"] = json!(stream);
             let (status, body) = send(
                 byok::router(
@@ -860,7 +1079,6 @@ async fn matching_http_protocols_forward_native_requests_and_responses() {
                 );
             }
             let (upstream_headers, forwarded) = receiver.recv().await.unwrap();
-            request["model"] = json!("native-model");
             assert_eq!(forwarded, request);
             if model_type == ModelType::Anthropic {
                 assert_eq!(upstream_headers["x-api-key"], "upstream");
@@ -872,7 +1090,7 @@ async fn matching_http_protocols_forward_native_requests_and_responses() {
             }
         }
     }
-    let mut error_request = json!({"model":"chat/native-model","messages":[],"native_error":true});
+    let error_request = json!({"model":"chat-native-model","messages":[],"native_error":true});
     let (status, body) = send(
         byok::router(
             store.clone(),
@@ -896,7 +1114,6 @@ async fn matching_http_protocols_forward_native_requests_and_responses() {
         serde_json::from_str::<Value>(&body).unwrap()["error"],
         "native-rate-limit"
     );
-    error_request["model"] = json!("native-model");
     assert_eq!(receiver.recv().await.unwrap().1, error_request);
     server.abort();
     drop(directory);

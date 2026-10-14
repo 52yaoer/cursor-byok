@@ -29,6 +29,7 @@ struct ApiState {
     plugins: PluginRegistry,
     provider: Arc<dyn Provider>,
     native: Option<NativeForwarder>,
+    rotation: Arc<models::ModelRotation>,
 }
 
 pub fn router(
@@ -47,6 +48,7 @@ pub fn router(
             plugins,
             provider,
             native,
+            rotation: Arc::default(),
         })
 }
 
@@ -155,10 +157,7 @@ async fn generate(
         Ok(models) => models,
         Err(error) => return api_error(StatusCode::CONFLICT, error),
     };
-    let Some(model) = models
-        .iter()
-        .find(|model| model.public_id == public_model_id)
-    else {
+    let Some(model) = state.rotation.select(&models, public_model_id) else {
         return api_error(StatusCode::NOT_FOUND, "model not found");
     };
     if let Some(native) = &state.native {
