@@ -3,7 +3,7 @@ use std::{str::FromStr, time::Duration};
 
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
-    SqlitePool,
+    Connection, SqlitePool,
 };
 
 use crate::Result;
@@ -27,6 +27,17 @@ impl Store {
         let database_path = options.get_filename().to_owned();
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
+            .after_release(|connection, _| {
+                Box::pin(async move {
+                    // Flush queued rollbacks before checking for a cancelled BEGIN.
+                    connection.ping().await?;
+                    if connection.is_in_transaction() {
+                        tracing::warn!("discarding SQLite connection with unfinished transaction");
+                        return Ok(false);
+                    }
+                    Ok(true)
+                })
+            })
             .connect_with(options)
             .await?;
         migrations::run(&pool, &database_path).await?;
