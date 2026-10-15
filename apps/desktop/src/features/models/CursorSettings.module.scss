@@ -142,10 +142,15 @@
 .modelRow {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 10px 12px;
   padding: 10px 2px;
   border-top: 1px solid var(--vscode-sideBar-border);
+
+  .modelCardActions {
+    min-width: 0;
+    align-items: center;
+  }
 }
 .modelRowName {
   min-width: 0;
