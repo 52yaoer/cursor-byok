@@ -22,6 +22,7 @@ use crate::{
     Error, Result,
 };
 
+use super::models::ModelHealth;
 use super::protocol::Protocol;
 
 #[derive(Default)]
@@ -197,6 +198,7 @@ pub(super) fn streamed(
     store: Store,
     plugins: PluginRegistry,
     model_hash: String,
+    health: ModelHealth,
 ) -> Response {
     let events = async_stream::stream! {
         let _cancel = CancelOnDrop(cancellation);
@@ -244,14 +246,20 @@ pub(super) fn streamed(
                     }
                 }
                 Err(error) => {
-                    if matches!(error, Error::Config(_) | Error::Provider(_) | Error::Http(_)) {
-                        super::disable_failed_model_or_plugin(&store, &plugins, &model_hash, error.to_string()).await;
-                    }
+                    super::handle_model_failure(
+                        &store,
+                        &plugins,
+                        &health,
+                        &model_hash,
+                        &error,
+                    )
+                    .await;
                     yield Ok(Event::default().event("error").data(json!({"error":{"message":error.to_string(),"type":"upstream_error"}}).to_string()));
                     return;
                 }
             }
         }
+        health.record_success(&model_hash);
         if output.finish.is_some() && matches!(protocol, Protocol::Chat) {
             yield Ok(Event::default().data("[DONE]"));
         }

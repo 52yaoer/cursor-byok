@@ -157,30 +157,82 @@ async fn generate(
         Ok(models) => models,
         Err(error) => return api_error(StatusCode::CONFLICT, error),
     };
-    let Some(model) = state.rotation.select(&models, public_model_id) else {
-        return api_error(StatusCode::NOT_FOUND, "model not found");
-    };
+    let configured = models
+        .iter()
+        .any(|model| model.public_id == public_model_id);
+    let candidates = state.rotation.candidates(&models, public_model_id);
+    if candidates.is_empty() {
+        return if configured {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "all configured channels for this model are temporarily cooling down",
+            )
+        } else {
+            api_error(StatusCode::NOT_FOUND, "model not found")
+        };
+    }
+    let health = state.rotation.health();
+    let mut last_error = None;
+    let mut last_transient_response = None;
+    let mut native_attempted = false;
     if let Some(native) = &state.native {
-        match state.store.model(&model.internal_id).await {
-            Ok(Some(config)) if protocol.provider_type() == config.provider_type() => {
-                return match native.forward(protocol, &headers, body, &config).await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        if is_model_failure(&error) {
-                            disable_failed_model_or_plugin(
+        for model in &candidates {
+            match state.store.model(&model.internal_id).await {
+                Ok(Some(config)) if protocol.provider_type() == config.provider_type() => {
+                    native_attempted = true;
+                    match native
+                        .forward(protocol, &headers, body.clone(), &config, health.clone())
+                        .await
+                    {
+                        Ok(response) if response.status().is_success() => {
+                            health.record_success(&model.internal_id);
+                            return response;
+                        }
+                        Ok(response) if is_transient_status(response.status()) => {
+                            health.record_failure(
+                                &model.internal_id,
+                                format!("upstream returned {}", response.status()),
+                            );
+                            last_transient_response = Some(response);
+                            continue;
+                        }
+                        Ok(response) => {
+                            if is_permanent_status(response.status()) {
+                                disable_failed_model_or_plugin(
+                                    &state.store,
+                                    &state.plugins,
+                                    &model.internal_id,
+                                    format!("upstream returned {}", response.status()),
+                                )
+                                .await;
+                            }
+                            return response;
+                        }
+                        Err(error) => {
+                            handle_model_failure(
                                 &state.store,
                                 &state.plugins,
+                                &health,
                                 &model.internal_id,
-                                error.to_string(),
+                                &error,
                             )
                             .await;
+                            last_error = Some(error);
                         }
-                        api_error(StatusCode::BAD_GATEWAY, error)
                     }
-                };
+                }
+                Ok(_) => {}
+                Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
             }
-            Ok(_) => {}
-            Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+        }
+        if native_attempted {
+            if let Some(response) = last_transient_response {
+                return response;
+            }
+            let error = last_error
+                .take()
+                .unwrap_or_else(|| Error::Provider("all native model channels failed".into()));
+            return api_error(StatusCode::BAD_GATEWAY, error);
         }
     }
     let parsed = match protocol::parse(protocol, &body) {
@@ -188,18 +240,24 @@ async fn generate(
         Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
     };
     let id = format!("external-api:{}", uuid::Uuid::new_v4());
-    let mut request = parsed.request;
-    request.model.model_id = model.internal_id.clone();
-    let invocation = ModelInvocation {
-        call_id: id.clone(),
-        run_id: id.clone(),
-        conversation_id: id.clone(),
-        provider_call_index: 0,
-        request,
-    };
-    let cancellation = CancellationToken::new();
-    let stream = state.provider.stream(invocation, cancellation.clone());
     if parsed.stream {
+        let Some(model) = candidates.first() else {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no healthy model channel available",
+            );
+        };
+        let mut request = parsed.request;
+        request.model.model_id = model.internal_id.clone();
+        let invocation = ModelInvocation {
+            call_id: id.clone(),
+            run_id: id.clone(),
+            conversation_id: id.clone(),
+            provider_call_index: 0,
+            request,
+        };
+        let cancellation = CancellationToken::new();
+        let stream = state.provider.stream(invocation, cancellation.clone());
         output::streamed(
             protocol,
             stream,
@@ -209,32 +267,108 @@ async fn generate(
             state.store,
             state.plugins,
             model.internal_id.clone(),
+            health,
         )
     } else {
-        match output::complete(protocol, stream, &id, &parsed.public_model_id).await {
-            Ok(response) => response.into_response(),
-            Err(Error::Protocol(message)) => api_error(StatusCode::BAD_REQUEST, message),
-            Err(error) => {
-                if is_model_failure(&error) {
-                    disable_failed_model_or_plugin(
+        for (attempt, model) in candidates.into_iter().enumerate() {
+            let mut request = parsed.request.clone();
+            request.model.model_id = model.internal_id.clone();
+            let attempt_id = format!("{id}:attempt-{attempt}");
+            let invocation = ModelInvocation {
+                call_id: attempt_id,
+                run_id: id.clone(),
+                conversation_id: id.clone(),
+                provider_call_index: attempt as u64,
+                request,
+            };
+            let cancellation = CancellationToken::new();
+            let stream = state.provider.stream(invocation, cancellation.clone());
+            match output::complete(protocol, stream, &id, &parsed.public_model_id).await {
+                Ok(response) => {
+                    health.record_success(&model.internal_id);
+                    return response.into_response();
+                }
+                Err(Error::Protocol(message)) => {
+                    return api_error(StatusCode::BAD_REQUEST, message)
+                }
+                Err(error) => {
+                    handle_model_failure(
                         &state.store,
                         &state.plugins,
+                        &health,
                         &model.internal_id,
-                        error.to_string(),
+                        &error,
                     )
                     .await;
+                    last_error = Some(error);
                 }
-                api_error(StatusCode::BAD_GATEWAY, error)
             }
         }
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            last_error
+                .unwrap_or_else(|| Error::Provider("no healthy model channel available".into())),
+        )
     }
 }
 
-fn is_model_failure(error: &Error) -> bool {
+fn is_transient_status(status: StatusCode) -> bool {
     matches!(
-        error,
-        Error::Config(_) | Error::Provider(_) | Error::Http(_)
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
     )
+}
+
+fn is_permanent_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_REQUEST
+            | StatusCode::UNAUTHORIZED
+            | StatusCode::FORBIDDEN
+            | StatusCode::NOT_FOUND
+            | StatusCode::UNPROCESSABLE_ENTITY
+    )
+}
+
+fn is_permanent_failure(error: &Error) -> bool {
+    match error {
+        Error::Config(_) => true,
+        Error::Provider(message) => {
+            let lower = message.to_ascii_lowercase();
+            [
+                " 400 ",
+                " 401 ",
+                " 403 ",
+                " 404 ",
+                " 422 ",
+                "invalid api key",
+                "model not found",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
+        }
+        Error::Http(_) => false,
+        _ => false,
+    }
+}
+
+async fn handle_model_failure(
+    store: &Store,
+    plugins: &PluginRegistry,
+    health: &models::ModelHealth,
+    model_id: &str,
+    error: &Error,
+) {
+    let message = error.to_string();
+    if is_permanent_failure(error) {
+        disable_failed_model_or_plugin(store, plugins, model_id, &message).await;
+    } else {
+        health.record_failure(model_id, message);
+    }
 }
 
 pub(super) async fn disable_failed_model(store: &Store, model_hash: &str, error: impl AsRef<str>) {

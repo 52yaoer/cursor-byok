@@ -21,7 +21,7 @@ use crate::{
     Error, Result,
 };
 
-use super::disable_failed_model;
+use super::models::ModelHealth;
 use super::protocol::Protocol;
 
 #[derive(Clone)]
@@ -53,6 +53,7 @@ impl NativeForwarder {
         incoming_headers: &HeaderMap,
         mut body: Value,
         model: &ModelConfig,
+        health: ModelHealth,
     ) -> Result<Response> {
         let call_id = format!("external-api:{}", uuid::Uuid::new_v4());
         let request_url = model.request_url()?;
@@ -156,7 +157,6 @@ impl NativeForwarder {
             Err(error) => {
                 let error = Error::Http(error);
                 recorder.failed(&error).await?;
-                disable_failed_model(&self.store, &model.model_hash, error.to_string()).await;
                 return Err(error);
             }
         };
@@ -172,6 +172,7 @@ impl NativeForwarder {
                 status,
                 &headers,
                 &model.model_hash,
+                health.clone(),
             ))
         } else {
             let bytes = match response.bytes().await {
@@ -179,7 +180,6 @@ impl NativeForwarder {
                 Err(error) => {
                     let error = Error::Http(error);
                     recorder.failed(&error).await?;
-                    disable_failed_model(&self.store, &model.model_hash, error.to_string()).await;
                     return Err(error);
                 }
             };
@@ -193,8 +193,7 @@ impl NativeForwarder {
                     if let Some(message) = summary.failure {
                         let error = Error::Provider(message);
                         recorder.failed(&error).await?;
-                        disable_failed_model(&self.store, &model.model_hash, error.to_string())
-                            .await;
+                        return Err(error);
                     } else {
                         recorder
                             .completed(summary.finish.unwrap_or(FinishReason::Stop))
@@ -206,7 +205,6 @@ impl NativeForwarder {
             } else {
                 let error = Error::Provider(native_error_message(status, &bytes));
                 recorder.failed(&error).await?;
-                disable_failed_model(&self.store, &model.model_hash, error.to_string()).await;
             }
             Ok(build_response(status, &headers, Body::from(bytes)))
         }
@@ -220,9 +218,9 @@ impl NativeForwarder {
         status: StatusCode,
         headers: &HeaderMap,
         model_hash: &str,
+        health: ModelHealth,
     ) -> Response {
         let idle_timeout = self.stream_idle_timeout;
-        let store = self.store.clone();
         let model_hash = model_hash.to_owned();
         let output = try_stream! {
             let _cancel = recorder.cancel_on_drop();
@@ -237,13 +235,13 @@ impl NativeForwarder {
                     Ok(Some(Err(error))) => {
                         let error = Error::Http(error);
                         recorder.failed(&error).await?;
-                        disable_failed_model(&store, &model_hash, error.to_string()).await;
+                        health.record_failure(&model_hash, error.to_string());
                         Err::<Bytes, Error>(error)?
                     }
                     Err(_) => {
                         let error = Error::Provider("native upstream stream idle timeout".into());
                         recorder.failed(&error).await?;
-                        disable_failed_model(&store, &model_hash, error.to_string()).await;
+                        health.record_failure(&model_hash, error.to_string());
                         Err::<Bytes, Error>(error)?
                     }
                 };
@@ -257,8 +255,9 @@ impl NativeForwarder {
                 if let Some(message) = summary.failure {
                     let error = Error::Provider(message);
                     recorder.failed(&error).await?;
-                    disable_failed_model(&store, &model_hash, error.to_string()).await;
+                    health.record_failure(&model_hash, error.to_string());
                 } else {
+                    health.record_success(&model_hash);
                     recorder.completed(summary.finish.unwrap_or(FinishReason::Stop)).await?;
                 }
             } else {

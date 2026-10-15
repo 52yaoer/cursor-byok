@@ -170,9 +170,8 @@ function ModelListRow({ model, disabled, testing, result, onTest, onEnabledChang
     <div className={styles.modelRowName}>
       <span className={styles.modelRowNameText}>{model.display_name}</span>
       <span className={styles.modelRowModelId}>{model.model_id}</span>
-      {model.last_error && <span className={styles.modelFailure} title={model.last_error}>{t("已自动停用：{error}", { error: model.last_error })}</span>}
     </div>
-    <CursorModelTestResult compact state={result} testing={testing} />
+    <CursorModelTestResult compact state={result} testing={testing} autoDisabledError={model.last_error ?? undefined} />
     <div className={styles.modelCardActions}>
       <Switch checked={model.enabled} disabled={disabled} label={t("启用 {model}", { model: model.display_name })} onChange={onEnabledChange} />
       <TruncatedButton size="small" disabled={disabled && !testing} label={testing ? t("取消测试") : t("测试")} onClick={onTest} />
@@ -196,9 +195,8 @@ function PluginModelRow({ model, disabled, testing, result, onTest, onEnabledCha
     <div className={styles.modelRowName}>
       <span className={styles.modelRowNameText}>{model.displayName}</span>
       <span className={styles.modelRowModelId}>{model.modelId}</span>
-      {model.lastError && <span className={styles.modelFailure} title={model.lastError}>{t("已自动停用：{error}", { error: model.lastError })}</span>}
     </div>
-    <CursorModelTestResult compact state={result} testing={testing} />
+    <CursorModelTestResult compact state={result} testing={testing} autoDisabledError={model.lastError ?? undefined} />
     <div className={styles.modelCardActions}>
       <Switch checked={model.enabled} disabled={disabled} label={t("启用 {model}", { model: model.displayName })} onChange={onEnabledChange} />
       <TruncatedButton size="small" disabled={disabled && !testing} label={testing ? t("取消测试") : t("测试")} onClick={onTest} />
@@ -283,7 +281,6 @@ function ModelGrid({
             <div className={styles.modelCardName}>
               <span className={styles.modelCardNameText}>{model.display_name}</span>
               <span className={styles.modelCardModelId}>{model.model_id}</span>
-              {model.last_error && <span className={styles.modelFailure} title={model.last_error}>{t("已自动停用：{error}", { error: model.last_error })}</span>}
             </div>
             <span className={styles.modelTypeBadge}>
               <Icon icon={model.type === "anthropic" ? claudeIcon : openAiIcon} />
@@ -291,7 +288,7 @@ function ModelGrid({
             </span>
           </div>
           <div className={styles.modelCardTest}>
-            <CursorModelTestResult state={result} testing={testing} />
+            <CursorModelTestResult state={result} testing={testing} autoDisabledError={model.last_error ?? undefined} />
           </div>
           <div className={styles.modelCardActions}>
             <Switch checked={model.enabled} disabled={disabled} label={t("启用 {model}", { model: model.display_name })} onChange={(enabled) => onEnabledChange(model, enabled)} />

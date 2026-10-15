@@ -23,6 +23,7 @@ use cursor_server::{
     plugin::{PluginRegistry, PluginRuntime},
     provider::{FinishReason, ModelEvent, ProviderRouter},
     store::ExternalApiSettings,
+    Error,
 };
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -1106,7 +1107,50 @@ async fn native_responses_rotate_between_same_named_models() {
 }
 
 #[tokio::test]
-async fn failed_native_rotation_model_is_disabled_and_reported() {
+async fn transient_provider_failure_falls_back_without_disabling_channel() {
+    let (_directory, store) = fixtures::temp_store().await;
+    store
+        .set_external_api_settings(ExternalApiSettings {
+            enabled: true,
+            api_key: "secret".into(),
+        })
+        .await
+        .unwrap();
+    for (sort_order, name) in [(1, "first"), (2, "second")] {
+        let mut input = model_input();
+        input.sort_order = sort_order;
+        input.display_name = name.into();
+        input.model_id = "gpt-6.1-sol".into();
+        input.openai_endpoint = OPENAI_RESPONSES_ENDPOINT.into();
+        store.create_model(&input).await.unwrap();
+    }
+    let runtime = PluginRuntime::managed().unwrap();
+    let plugins = PluginRegistry::managed(store.clone(), runtime, "0.1.0".into()).unwrap();
+    let provider = fake_provider::FakeProvider::default();
+    provider.push_error(Error::Provider(
+        "provider error: upstream returned 502 Bad Gateway".into(),
+    ));
+    provider.push(vec![
+        ModelEvent::TextDelta("recovered".into()),
+        ModelEvent::Done(FinishReason::Stop),
+    ]);
+    let router = byok::router(store.clone(), plugins, Arc::new(provider), None);
+
+    let (status, body) = send(
+        router,
+        "POST",
+        "/byok/v1/responses",
+        Some("secret"),
+        json!({"model":"gpt-6.1-sol","input":"hello"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("recovered"));
+    assert_eq!(store.enabled_models().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn transient_native_rotation_model_is_cooled_down_and_kept_enabled() {
     let (_directory, store) = fixtures::temp_store().await;
     store
         .set_external_api_settings(ExternalApiSettings {
@@ -1159,7 +1203,7 @@ async fn failed_native_rotation_model_is_disabled_and_reported() {
         )),
     );
 
-    let (status, _) = send(
+    let (status, body) = send(
         router.clone(),
         "POST",
         "/byok/v1/responses",
@@ -1167,18 +1211,15 @@ async fn failed_native_rotation_model_is_disabled_and_reported() {
         json!({"model":"gpt-6.1-sol","input":"hello"}),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(status, StatusCode::OK, "{body}");
 
     let models = store.models().await.unwrap();
     let broken = models
         .iter()
         .find(|model| model.display_name == "broken")
         .unwrap();
-    assert!(!broken.enabled);
-    assert_eq!(
-        serde_json::to_value(broken).unwrap()["last_error"],
-        "provider error: upstream returned 502 Bad Gateway: broken upstream"
-    );
+    assert!(broken.enabled);
+    assert!(broken.last_error.is_none());
 
     let (status, _) = send(
         router,
@@ -1189,12 +1230,7 @@ async fn failed_native_rotation_model_is_disabled_and_reported() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(store
-        .enabled_models()
-        .await
-        .unwrap()
-        .iter()
-        .all(|model| model.display_name == "healthy"));
+    assert_eq!(store.enabled_models().await.unwrap().len(), 2);
     server.abort();
 }
 

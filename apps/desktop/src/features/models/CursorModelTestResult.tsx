@@ -9,17 +9,45 @@ export type CursorModelTestState =
   | { status: "error"; error: string }
   | { status: "cancelled" };
 
-export function CursorModelTestResult({ state, testing = false, compact = false }: {
+export function CursorModelTestResult({ state, testing = false, compact = false, autoDisabledError }: {
   state?: CursorModelTestState;
   testing?: boolean;
   /** 列表行内的紧凑徽标形态:未测试时不渲染,详情放入悬浮提示。 */
   compact?: boolean;
+  /** 自动停用时复用测试结果区域展示错误，避免撑开模型标题区域。 */
+  autoDisabledError?: string;
 }) {
   if (testing) {
     return compact
       ? <span className={`${styles.compact} ${styles.testing}`}>{t("测试中…")}</span>
       : <div className={`${styles.root} ${styles.testing}`}><span className={styles.summary}>{t("测试中…")}</span></div>;
   }
+  if (state?.status === "cancelled" && autoDisabledError === undefined) {
+    return compact
+      ? <span className={`${styles.compact} ${styles.idle}`}>{t("测试已取消")}</span>
+      : <div className={`${styles.root} ${styles.idle}`}><span className={styles.summary}>{t("测试已取消")}</span></div>;
+  }
+
+  const error = autoDisabledError ?? (state?.status === "error" ? state.error : undefined);
+  if (error !== undefined) {
+    const summary = t("错误：{error}", { error });
+    const detail = autoDisabledError !== undefined
+      ? t("已自动停用：{error}", { error })
+      : t("测试失败：{error}", { error });
+    if (compact) {
+      return <TooltipTrigger label={detail}>
+        <span className={`${styles.compact} ${styles.error}`}>
+          {t("测试失败")}
+          <Icon icon={informationOutlineIcon} size="1em" />
+        </span>
+      </TooltipTrigger>;
+    }
+    return <div className={`${styles.root} ${styles.error}`}>
+      <span className={styles.summary}>{summary}</span>
+      <TooltipTrigger label={detail}><button type="button" className={styles.details}>{t("查看详情")}<Icon icon={informationOutlineIcon} size="1.1em" /></button></TooltipTrigger>
+    </div>;
+  }
+
   if (!state) {
     return compact ? null : <div className={`${styles.root} ${styles.idle}`}><span className={styles.summary}>{t("未测试")}</span></div>;
   }
