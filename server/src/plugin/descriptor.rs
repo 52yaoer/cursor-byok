@@ -137,6 +137,8 @@ pub struct PluginModelDescriptor {
     pub max_output_tokens: Option<u64>,
     pub images: bool,
     pub enabled: bool,
+    pub last_error: Option<String>,
+    pub last_error_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -294,6 +296,8 @@ impl PluginModelDescriptor {
             max_output_tokens: model.max_output_tokens,
             images: model.images,
             enabled: model.enabled,
+            last_error: model.last_error.clone(),
+            last_error_at_ms: model.last_error_at_ms,
         }
     }
 }

@@ -152,6 +152,8 @@ pub struct ModelConfig {
     pub thinking_budget_tokens: Option<u64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    pub last_error: Option<String>,
+    pub last_error_at_ms: Option<i64>,
 }
 
 impl ModelConfig {

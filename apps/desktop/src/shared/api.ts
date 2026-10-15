@@ -29,6 +29,8 @@ export interface Model {
   thinking_budget_tokens: number | null;
   created_at_ms: number;
   updated_at_ms: number;
+  last_error: string | null;
+  last_error_at_ms: number | null;
 }
 
 export interface ModelInput {
@@ -292,6 +294,8 @@ export interface PluginModelDescriptor {
   maxOutputTokens: number | null;
   images: boolean;
   enabled: boolean;
+  lastError: string | null;
+  lastErrorAtMs: number | null;
 }
 
 export interface PluginProviderDescriptor {

@@ -21,6 +21,7 @@ use crate::{
     Error, Result,
 };
 
+use super::disable_failed_model;
 use super::protocol::Protocol;
 
 #[derive(Clone)]
@@ -155,6 +156,7 @@ impl NativeForwarder {
             Err(error) => {
                 let error = Error::Http(error);
                 recorder.failed(&error).await?;
+                disable_failed_model(&self.store, &model.model_hash, error.to_string()).await;
                 return Err(error);
             }
         };
@@ -163,13 +165,21 @@ impl NativeForwarder {
         let headers = response.headers().clone();
         let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
         if stream && status.is_success() {
-            Ok(self.stream_response(protocol, response, recorder, status, &headers))
+            Ok(self.stream_response(
+                protocol,
+                response,
+                recorder,
+                status,
+                &headers,
+                &model.model_hash,
+            ))
         } else {
             let bytes = match response.bytes().await {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     let error = Error::Http(error);
                     recorder.failed(&error).await?;
+                    disable_failed_model(&self.store, &model.model_hash, error.to_string()).await;
                     return Err(error);
                 }
             };
@@ -181,7 +191,10 @@ impl NativeForwarder {
                         recorder.usage(usage).await?;
                     }
                     if let Some(message) = summary.failure {
-                        recorder.failed(&Error::Provider(message)).await?;
+                        let error = Error::Provider(message);
+                        recorder.failed(&error).await?;
+                        disable_failed_model(&self.store, &model.model_hash, error.to_string())
+                            .await;
                     } else {
                         recorder
                             .completed(summary.finish.unwrap_or(FinishReason::Stop))
@@ -191,9 +204,9 @@ impl NativeForwarder {
                     recorder.completed(FinishReason::Stop).await?;
                 }
             } else {
-                recorder
-                    .failed(&Error::Provider(format!("upstream returned {status}")))
-                    .await?;
+                let error = Error::Provider(native_error_message(status, &bytes));
+                recorder.failed(&error).await?;
+                disable_failed_model(&self.store, &model.model_hash, error.to_string()).await;
             }
             Ok(build_response(status, &headers, Body::from(bytes)))
         }
@@ -206,8 +219,11 @@ impl NativeForwarder {
         recorder: CallRecorder,
         status: StatusCode,
         headers: &HeaderMap,
+        model_hash: &str,
     ) -> Response {
         let idle_timeout = self.stream_idle_timeout;
+        let store = self.store.clone();
+        let model_hash = model_hash.to_owned();
         let output = try_stream! {
             let _cancel = recorder.cancel_on_drop();
             let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(8);
@@ -221,11 +237,13 @@ impl NativeForwarder {
                     Ok(Some(Err(error))) => {
                         let error = Error::Http(error);
                         recorder.failed(&error).await?;
+                        disable_failed_model(&store, &model_hash, error.to_string()).await;
                         Err::<Bytes, Error>(error)?
                     }
                     Err(_) => {
                         let error = Error::Provider("native upstream stream idle timeout".into());
                         recorder.failed(&error).await?;
+                        disable_failed_model(&store, &model_hash, error.to_string()).await;
                         Err::<Bytes, Error>(error)?
                     }
                 };
@@ -237,7 +255,9 @@ impl NativeForwarder {
             if let Ok(summary) = observer.await {
                 if let Some(usage) = summary.usage { recorder.usage(usage).await?; }
                 if let Some(message) = summary.failure {
-                    recorder.failed(&Error::Provider(message)).await?;
+                    let error = Error::Provider(message);
+                    recorder.failed(&error).await?;
+                    disable_failed_model(&store, &model_hash, error.to_string()).await;
                 } else {
                     recorder.completed(summary.finish.unwrap_or(FinishReason::Stop)).await?;
                 }
@@ -262,6 +282,24 @@ fn build_response(status: StatusCode, headers: &HeaderMap, body: Body) -> Respon
         }
     }
     response
+}
+
+fn native_error_message(status: StatusCode, body: &[u8]) -> String {
+    let message = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.pointer("/message"))
+                .or_else(|| value.get("error"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|message| !message.trim().is_empty());
+    match message {
+        Some(message) => format!("upstream returned {status}: {message}"),
+        None => format!("upstream returned {status}"),
+    }
 }
 
 #[derive(Default)]

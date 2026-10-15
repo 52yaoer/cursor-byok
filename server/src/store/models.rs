@@ -16,7 +16,7 @@ const MODEL_COLUMNS: &str = r#"
     openai_extra_params_json, custom_headers_enabled, custom_headers_json,
     anthropic_extra_params_enabled, anthropic_extra_params_json, context_window_tokens,
     max_completion_tokens, anthropic_max_tokens, anthropic_thinking_effort,
-    thinking_budget_tokens, created_at_ms, updated_at_ms
+    thinking_budget_tokens, created_at_ms, updated_at_ms, last_error, last_error_at_ms
 "#;
 
 impl Store {
@@ -141,7 +141,9 @@ impl Store {
                 custom_headers_enabled = ?, custom_headers_json = ?,
                 anthropic_extra_params_enabled = ?, anthropic_extra_params_json = ?,
                 context_window_tokens = ?, max_completion_tokens = ?, anthropic_max_tokens = ?,
-                anthropic_thinking_effort = ?, thinking_budget_tokens = ?, updated_at_ms = ?
+                anthropic_thinking_effort = ?, thinking_budget_tokens = ?, updated_at_ms = ?,
+                last_error = CASE WHEN ? THEN NULL ELSE last_error END,
+                last_error_at_ms = CASE WHEN ? THEN NULL ELSE last_error_at_ms END
             WHERE model_hash = ?"#,
         )
         .bind(&next_hash)
@@ -169,6 +171,8 @@ impl Store {
         .bind(&input.anthropic_thinking_effort)
         .bind(input.thinking_budget_tokens.map(to_i64).transpose()?)
         .bind(now)
+        .bind(input.enabled)
+        .bind(input.enabled)
         .bind(current_hash)
         .execute(&mut *transaction)
         .await?;
@@ -198,6 +202,21 @@ impl Store {
         }
         transaction.commit().await?;
         Ok(())
+    }
+
+    pub async fn disable_model_with_error(&self, hash: &str, error: &str) -> Result<bool> {
+        let _write = self.writes.lock().await;
+        let now = now_ms();
+        let result = sqlx::query(
+            "UPDATE model_configs SET enabled = 0, last_error = ?, last_error_at_ms = ?, updated_at_ms = ? WHERE model_hash = ? AND enabled = 1",
+        )
+        .bind(error)
+        .bind(now)
+        .bind(now)
+        .bind(hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn reorder_models(&self, model_hashes: &[String]) -> Result<Vec<ModelConfig>> {
@@ -335,6 +354,8 @@ fn model_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ModelConfig> {
         thinking_budget_tokens: optional_u64(&row, "thinking_budget_tokens")?,
         created_at_ms: row.try_get("created_at_ms")?,
         updated_at_ms: row.try_get("updated_at_ms")?,
+        last_error: row.try_get("last_error")?,
+        last_error_at_ms: row.try_get("last_error_at_ms")?,
     })
 }
 
@@ -413,6 +434,32 @@ mod tests {
         assert!(enabled.enabled);
         assert_eq!(store.enabled_models().await.unwrap().len(), 1);
         assert_eq!(store.models().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_model_is_disabled_and_reenabling_clears_its_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", directory.path().join("test.db").display());
+        let store = Store::connect(&url).await.unwrap();
+        let model = store.create_model(&model_input(None)).await.unwrap();
+
+        assert!(store
+            .disable_model_with_error(&model.model_hash, "upstream returned 502")
+            .await
+            .unwrap());
+        let failed = store.model(&model.model_hash).await.unwrap().unwrap();
+        assert!(!failed.enabled);
+        assert_eq!(failed.last_error.as_deref(), Some("upstream returned 502"));
+        assert!(failed.last_error_at_ms.is_some());
+        assert!(store.enabled_models().await.unwrap().is_empty());
+
+        let reenabled = store
+            .update_model(&model.model_hash, &model_input(None))
+            .await
+            .unwrap();
+        assert!(reenabled.enabled);
+        assert!(reenabled.last_error.is_none());
+        assert!(reenabled.last_error_at_ms.is_none());
     }
 
     /// 分组名是纯展示字段:入库时去除首尾空白、空串归一为 NULL,

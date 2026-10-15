@@ -250,6 +250,14 @@ export const appStore = {
     }
   },
 
+  async refreshModels() {
+    try {
+      update({ models: await api.models() });
+    } catch {
+      // A passive status refresh should not replace the visible model list.
+    }
+  },
+
   async openCallDetails(callId: string) {
     await perform(() => api.openCallDetails(callId));
   },

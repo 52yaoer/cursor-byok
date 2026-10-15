@@ -170,6 +170,7 @@ function ModelListRow({ model, disabled, testing, result, onTest, onEnabledChang
     <div className={styles.modelRowName}>
       <span className={styles.modelRowNameText}>{model.display_name}</span>
       <span className={styles.modelRowModelId}>{model.model_id}</span>
+      {model.last_error && <span className={styles.modelFailure} title={model.last_error}>{t("已自动停用：{error}", { error: model.last_error })}</span>}
     </div>
     <CursorModelTestResult compact state={result} testing={testing} />
     <div className={styles.modelCardActions}>
@@ -195,6 +196,7 @@ function PluginModelRow({ model, disabled, testing, result, onTest, onEnabledCha
     <div className={styles.modelRowName}>
       <span className={styles.modelRowNameText}>{model.displayName}</span>
       <span className={styles.modelRowModelId}>{model.modelId}</span>
+      {model.lastError && <span className={styles.modelFailure} title={model.lastError}>{t("已自动停用：{error}", { error: model.lastError })}</span>}
     </div>
     <CursorModelTestResult compact state={result} testing={testing} />
     <div className={styles.modelCardActions}>
@@ -281,6 +283,7 @@ function ModelGrid({
             <div className={styles.modelCardName}>
               <span className={styles.modelCardNameText}>{model.display_name}</span>
               <span className={styles.modelCardModelId}>{model.model_id}</span>
+              {model.last_error && <span className={styles.modelFailure} title={model.last_error}>{t("已自动停用：{error}", { error: model.last_error })}</span>}
             </div>
             <span className={styles.modelTypeBadge}>
               <Icon icon={model.type === "anthropic" ? claudeIcon : openAiIcon} />

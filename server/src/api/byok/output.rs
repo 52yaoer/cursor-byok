@@ -16,7 +16,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     model::Usage,
+    plugin::PluginRegistry,
     provider::{FinishReason, ModelEvent, ProviderStream},
+    store::Store,
     Error, Result,
 };
 
@@ -192,6 +194,9 @@ pub(super) fn streamed(
     cancellation: CancellationToken,
     id: String,
     model: String,
+    store: Store,
+    plugins: PluginRegistry,
+    model_hash: String,
 ) -> Response {
     let events = async_stream::stream! {
         let _cancel = CancelOnDrop(cancellation);
@@ -239,6 +244,9 @@ pub(super) fn streamed(
                     }
                 }
                 Err(error) => {
+                    if matches!(error, Error::Config(_) | Error::Provider(_) | Error::Http(_)) {
+                        super::disable_failed_model_or_plugin(&store, &plugins, &model_hash, error.to_string()).await;
+                    }
                     yield Ok(Event::default().event("error").data(json!({"error":{"message":error.to_string(),"type":"upstream_error"}}).to_string()));
                     return;
                 }

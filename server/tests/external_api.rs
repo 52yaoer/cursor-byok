@@ -1106,6 +1106,99 @@ async fn native_responses_rotate_between_same_named_models() {
 }
 
 #[tokio::test]
+async fn failed_native_rotation_model_is_disabled_and_reported() {
+    let (_directory, store) = fixtures::temp_store().await;
+    store
+        .set_external_api_settings(ExternalApiSettings {
+            enabled: true,
+            api_key: "secret".into(),
+        })
+        .await
+        .unwrap();
+    let upstream = Router::new().route(
+        "/{channel}/v1/responses",
+        post(
+            |axum::extract::Path(channel): axum::extract::Path<String>| async move {
+                if channel == "broken" {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error":{"message":"broken upstream"}})),
+                    )
+                        .into_response()
+                } else {
+                    Json(json!({"object":"response","status":"completed","output":[]}))
+                        .into_response()
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    for (sort_order, channel) in [(0, "broken"), (1, "healthy")] {
+        let mut input = model_input();
+        input.sort_order = sort_order;
+        input.model_id = "gpt-6.1-sol".into();
+        input.openai_endpoint = OPENAI_RESPONSES_ENDPOINT.into();
+        input.base_url = format!("http://127.0.0.1:{port}/{channel}/v1/responses");
+        input.use_full_url = true;
+        input.display_name = channel.into();
+        store.create_model(&input).await.unwrap();
+    }
+    let runtime = PluginRuntime::managed().unwrap();
+    let plugins = PluginRegistry::managed(store.clone(), runtime, "0.1.0".into()).unwrap();
+    let router = byok::router(
+        store.clone(),
+        plugins,
+        Arc::new(fake_provider::FakeProvider::default()),
+        Some(byok::NativeForwarder::new(
+            store.clone(),
+            NetworkClients::new(store.clone()),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )),
+    );
+
+    let (status, _) = send(
+        router.clone(),
+        "POST",
+        "/byok/v1/responses",
+        Some("secret"),
+        json!({"model":"gpt-6.1-sol","input":"hello"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    let models = store.models().await.unwrap();
+    let broken = models
+        .iter()
+        .find(|model| model.display_name == "broken")
+        .unwrap();
+    assert!(!broken.enabled);
+    assert_eq!(
+        serde_json::to_value(broken).unwrap()["last_error"],
+        "provider error: upstream returned 502 Bad Gateway: broken upstream"
+    );
+
+    let (status, _) = send(
+        router,
+        "POST",
+        "/byok/v1/responses",
+        Some("secret"),
+        json!({"model":"gpt-6.1-sol","input":"hello"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(store
+        .enabled_models()
+        .await
+        .unwrap()
+        .iter()
+        .all(|model| model.display_name == "healthy"));
+    server.abort();
+}
+
+#[tokio::test]
 async fn matching_http_protocols_forward_native_requests_and_responses() {
     let (directory, store) = fixtures::temp_store().await;
     store

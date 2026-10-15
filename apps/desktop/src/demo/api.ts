@@ -223,6 +223,8 @@ function createModel({ hash, order, name, type, url, modelId, endpoint = "/v1/re
     thinking_budget_tokens: null,
     created_at_ms: FIXED_NOW - order * 86_400_000,
     updated_at_ms: FIXED_NOW,
+    last_error: null,
+    last_error_at_ms: null,
   };
 }
 

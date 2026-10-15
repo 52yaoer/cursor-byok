@@ -957,6 +957,42 @@ impl PluginRegistry {
             .await
     }
 
+    pub async fn disable_model_with_error(&self, model_id: &str, error: &str) -> Result<bool> {
+        let (plugin_id, provider_id, upstream_id) = parse_model_id(model_id)
+            .ok_or_else(|| Error::Provider(format!("invalid plugin model ID: {model_id}")))?;
+        let stored = self.inner.state.models(plugin_id, provider_id).await?;
+        let mut secrets = Vec::new();
+        if let Some(model) = stored.iter().find(|model| model.id == upstream_id) {
+            collect_private_strings(&model.private_data, &mut secrets);
+        }
+        if let Ok(executable) = self.executable() {
+            if let Ok(entry) = self.find_entry(&executable, plugin_id).await {
+                if let Ok(provider) = find_provider(&entry, provider_id) {
+                    if let Some(resource_type) = provider.resource_type.as_deref() {
+                        if let Ok(resources) =
+                            self.inner.state.resources(plugin_id, resource_type).await
+                        {
+                            for resource in resources {
+                                collect_private_strings(&resource.private_data, &mut secrets);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut message = error.to_owned();
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        secrets.dedup();
+        for secret in secrets.into_iter().filter(|secret| secret.len() >= 8) {
+            message = message.replace(&secret, "[redacted]");
+        }
+        let message = message.chars().take(2000).collect::<String>();
+        self.inner
+            .state
+            .disable_model_with_error(plugin_id, provider_id, upstream_id, &message)
+            .await
+    }
+
     pub async fn remove(&self, plugin_id: &str) -> Result<()> {
         if let Some(worker) = self.inner.workers.lock().await.remove(plugin_id) {
             worker.stop().await;
@@ -1371,4 +1407,21 @@ fn find_resource<'a>(
                 entry.manifest.id
             ))
         })
+}
+
+fn collect_private_strings(value: &serde_json::Value, output: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value) => output.push(value.clone()),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_private_strings(value, output);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_private_strings(value, output);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
 }

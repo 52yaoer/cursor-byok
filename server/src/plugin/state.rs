@@ -141,6 +141,10 @@ pub struct StoredModel {
     #[serde(default = "default_model_enabled")]
     pub enabled: bool,
     #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_error_at_ms: Option<i64>,
+    #[serde(default)]
     pub private_data: serde_json::Value,
 }
 
@@ -186,6 +190,8 @@ impl StoredModel {
                 .and_then(serde_json::Value::as_u64),
             images: capability("images"),
             enabled: true,
+            last_error: None,
+            last_error_at_ms: None,
             private_data: object
                 .get("privateData")
                 .cloned()
@@ -342,6 +348,8 @@ impl PluginStateStore {
             .map(|mut model| {
                 if let Some(old) = previous.iter().find(|old| old.id == model.id) {
                     model.enabled = old.enabled;
+                    model.last_error = old.last_error.clone();
+                    model.last_error_at_ms = old.last_error_at_ms;
                 }
                 model
             })
@@ -368,6 +376,10 @@ impl PluginStateStore {
             .find(|model| model.id == model_id)
             .ok_or_else(|| Error::RunNotFound(format!("plugin model {model_id}")))?;
         model.enabled = enabled;
+        if enabled {
+            model.last_error = None;
+            model.last_error_at_ms = None;
+        }
         self.data
             .update(
                 plugin_id,
@@ -375,6 +387,34 @@ impl PluginStateStore {
                 &serde_json::to_value(models)?,
             )
             .await
+    }
+
+    pub async fn disable_model_with_error(
+        &self,
+        plugin_id: &str,
+        provider_id: &str,
+        model_id: &str,
+        error: &str,
+    ) -> Result<bool> {
+        let mut models = self.models(plugin_id, provider_id).await?;
+        let model = models
+            .iter_mut()
+            .find(|model| model.id == model_id)
+            .ok_or_else(|| Error::RunNotFound(format!("plugin model {model_id}")))?;
+        if !model.enabled {
+            return Ok(false);
+        }
+        model.enabled = false;
+        model.last_error = Some(error.to_owned());
+        model.last_error_at_ms = Some(now_ms());
+        self.data
+            .update(
+                plugin_id,
+                &model_key(provider_id),
+                &serde_json::to_value(models)?,
+            )
+            .await?;
+        Ok(true)
     }
 
     pub async fn clear(&self, plugin_id: &str) -> Result<()> {
@@ -493,5 +533,35 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert!(models[0].images);
         assert_eq!(models[0].private_data["reasoningEfforts"][0], "low");
+    }
+
+    #[tokio::test]
+    async fn failed_models_stay_disabled_until_reenabled() {
+        let (_root, store) = store();
+        let model = StoredModel::from_definition(&serde_json::json!({
+            "id": "gpt-test",
+            "displayName": "GPT Test",
+        }))
+        .unwrap();
+        store
+            .replace_models("dev.example", "codex", &[model])
+            .await
+            .unwrap();
+        assert!(store
+            .disable_model_with_error("dev.example", "codex", "gpt-test", "upstream 502")
+            .await
+            .unwrap());
+        let failed = store.models("dev.example", "codex").await.unwrap();
+        assert!(!failed[0].enabled);
+        assert_eq!(failed[0].last_error.as_deref(), Some("upstream 502"));
+        assert!(failed[0].last_error_at_ms.is_some());
+        store
+            .set_model_enabled("dev.example", "codex", "gpt-test", true)
+            .await
+            .unwrap();
+        let reenabled = store.models("dev.example", "codex").await.unwrap();
+        assert!(reenabled[0].enabled);
+        assert!(reenabled[0].last_error.is_none());
+        assert!(reenabled[0].last_error_at_ms.is_none());
     }
 }

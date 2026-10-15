@@ -165,6 +165,13 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .modelFailure {
+    overflow: hidden;
+    color: var(--vscode-errorForeground, #f48771);
+    font-size: type.$font-size-2xs;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .modelRowNameText {
     color: var(--vscode-foreground);
     font-size: type.$font-size-base;
@@ -211,6 +218,13 @@
   .modelCardModelId {
     color: var(--vscode-descriptionForeground);
     font-size: type.$font-size-2xs;
+  }
+  .modelFailure {
+    overflow: hidden;
+    color: var(--vscode-errorForeground, #f48771);
+    font-size: type.$font-size-2xs;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 }
 .modelTypeBadge {

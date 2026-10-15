@@ -800,6 +800,8 @@ mod tests {
             thinking_budget_tokens: None,
             created_at_ms: 0,
             updated_at_ms: 0,
+            last_error: None,
+            last_error_at_ms: None,
         }
     }
 
@@ -833,6 +835,8 @@ mod tests {
             max_output_tokens: None,
             images: false,
             enabled: true,
+            last_error: None,
+            last_error_at_ms: None,
         });
         assert_eq!(details.model_id, "plugin:test/provider/model");
         let agent::model_details::Credentials::ApiKeyCredentials(credentials) =

@@ -67,6 +67,27 @@ export function CursorSettingsPage() {
     if (caCommand) void api.copyCursorText(caCommand);
   }, [caCommand]);
 
+  useEffect(() => {
+    let refreshing = false;
+    const refreshModels = async () => {
+      if (document.visibilityState !== "visible" || refreshing) return;
+      refreshing = true;
+      try {
+        await Promise.all([appStore.refreshModels(), appStore.refreshPlugins()]);
+      } finally {
+        refreshing = false;
+      }
+    };
+    const timer = window.setInterval(() => void refreshModels(), 5_000);
+    window.addEventListener("focus", refreshModels);
+    document.addEventListener("visibilitychange", refreshModels);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refreshModels);
+      document.removeEventListener("visibilitychange", refreshModels);
+    };
+  }, []);
+
   const initializeCa = async () => {
     const status = await appStore.initializeCursorCa();
     if (status?.ca === "untrusted" && status.ca_install_command) setCaCommand(status.ca_install_command);

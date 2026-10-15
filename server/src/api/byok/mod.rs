@@ -165,7 +165,18 @@ async fn generate(
             Ok(Some(config)) if protocol.provider_type() == config.provider_type() => {
                 return match native.forward(protocol, &headers, body, &config).await {
                     Ok(response) => response,
-                    Err(error) => api_error(StatusCode::BAD_GATEWAY, error),
+                    Err(error) => {
+                        if is_model_failure(&error) {
+                            disable_failed_model_or_plugin(
+                                &state.store,
+                                &state.plugins,
+                                &model.internal_id,
+                                error.to_string(),
+                            )
+                            .await;
+                        }
+                        api_error(StatusCode::BAD_GATEWAY, error)
+                    }
                 };
             }
             Ok(_) => {}
@@ -189,12 +200,77 @@ async fn generate(
     let cancellation = CancellationToken::new();
     let stream = state.provider.stream(invocation, cancellation.clone());
     if parsed.stream {
-        output::streamed(protocol, stream, cancellation, id, parsed.public_model_id)
+        output::streamed(
+            protocol,
+            stream,
+            cancellation,
+            id,
+            parsed.public_model_id,
+            state.store,
+            state.plugins,
+            model.internal_id.clone(),
+        )
     } else {
         match output::complete(protocol, stream, &id, &parsed.public_model_id).await {
             Ok(response) => response.into_response(),
             Err(Error::Protocol(message)) => api_error(StatusCode::BAD_REQUEST, message),
-            Err(error) => api_error(StatusCode::BAD_GATEWAY, error),
+            Err(error) => {
+                if is_model_failure(&error) {
+                    disable_failed_model_or_plugin(
+                        &state.store,
+                        &state.plugins,
+                        &model.internal_id,
+                        error.to_string(),
+                    )
+                    .await;
+                }
+                api_error(StatusCode::BAD_GATEWAY, error)
+            }
         }
+    }
+}
+
+fn is_model_failure(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Config(_) | Error::Provider(_) | Error::Http(_)
+    )
+}
+
+pub(super) async fn disable_failed_model(store: &Store, model_hash: &str, error: impl AsRef<str>) {
+    let mut message = error.as_ref().to_owned();
+    if let Ok(Some(model)) = store.model(model_hash).await {
+        if model.api_key.len() >= 12 {
+            message = message.replace(&model.api_key, "[redacted]");
+        }
+        if let Some(headers) = model.custom_headers.as_object() {
+            for (name, value) in headers {
+                if crate::model::is_sensitive_header(name) {
+                    if let Some(secret) = value.as_str().filter(|value| value.len() >= 12) {
+                        message = message.replace(secret, "[redacted]");
+                    }
+                }
+            }
+        }
+    }
+    let message = message.chars().take(2000).collect::<String>();
+    if let Err(disable_error) = store.disable_model_with_error(model_hash, &message).await {
+        tracing::warn!(model_hash, %disable_error, "failed to disable unavailable model");
+    }
+}
+
+pub(super) async fn disable_failed_model_or_plugin(
+    store: &Store,
+    plugins: &PluginRegistry,
+    model_id: &str,
+    error: impl AsRef<str>,
+) {
+    let message = error.as_ref().chars().take(2000).collect::<String>();
+    if crate::plugin::parse_model_id(model_id).is_some() {
+        if let Err(disable_error) = plugins.disable_model_with_error(model_id, &message).await {
+            tracing::warn!(model_id, %disable_error, "failed to disable unavailable plugin model");
+        }
+    } else {
+        disable_failed_model(store, model_id, &message).await;
     }
 }
