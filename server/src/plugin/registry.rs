@@ -958,6 +958,29 @@ impl PluginRegistry {
     }
 
     pub async fn disable_model_with_error(&self, model_id: &str, error: &str) -> Result<bool> {
+        let message = self.redact_model_error(model_id, error).await?;
+        let (plugin_id, provider_id, upstream_id) = parse_model_id(model_id)
+            .ok_or_else(|| Error::Provider(format!("invalid plugin model ID: {model_id}")))?;
+        self.inner
+            .state
+            .disable_model_with_error(plugin_id, provider_id, upstream_id, &message)
+            .await
+    }
+
+    pub async fn set_model_error(&self, model_id: &str, error: Option<&str>) -> Result<()> {
+        let message = match error {
+            Some(error) => Some(self.redact_model_error(model_id, error).await?),
+            None => None,
+        };
+        let (plugin_id, provider_id, upstream_id) = parse_model_id(model_id)
+            .ok_or_else(|| Error::Provider(format!("invalid plugin model ID: {model_id}")))?;
+        self.inner
+            .state
+            .set_model_error(plugin_id, provider_id, upstream_id, message.as_deref())
+            .await
+    }
+
+    async fn redact_model_error(&self, model_id: &str, error: &str) -> Result<String> {
         let (plugin_id, provider_id, upstream_id) = parse_model_id(model_id)
             .ok_or_else(|| Error::Provider(format!("invalid plugin model ID: {model_id}")))?;
         let stored = self.inner.state.models(plugin_id, provider_id).await?;
@@ -986,11 +1009,7 @@ impl PluginRegistry {
         for secret in secrets.into_iter().filter(|secret| secret.len() >= 8) {
             message = message.replace(&secret, "[redacted]");
         }
-        let message = message.chars().take(2000).collect::<String>();
-        self.inner
-            .state
-            .disable_model_with_error(plugin_id, provider_id, upstream_id, &message)
-            .await
+        Ok(message.chars().take(2000).collect())
     }
 
     pub async fn remove(&self, plugin_id: &str) -> Result<()> {

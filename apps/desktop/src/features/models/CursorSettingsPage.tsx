@@ -33,7 +33,7 @@ export function CursorSettingsPage() {
   const [deleting, setDeleting] = useState<Model | null>(null);
   const [confirmDisableTakeover, setConfirmDisableTakeover] = useState(false);
   const [testingModelHashes, setTestingModelHashes] = useState<Set<string>>(() => new Set());
-  const [modelTestResults, setModelTestResults] = useState<Map<string, CursorModelTestState>>(() => new Map());
+  const [modelTestResults, setModelTestResults] = useState<Map<string, Exclude<CursorModelTestState, { status: "error" }>>>(() => new Map());
   const [savingAndTesting, setSavingAndTesting] = useState(false);
   const [batchTesting, setBatchTesting] = useState(false);
   const [togglingModelEnabled, setTogglingModelEnabled] = useState(false);
@@ -48,6 +48,17 @@ export function CursorSettingsPage() {
   const cursorTakenOver = cursorHarness?.settings_applied ?? false;
   const takeoverLabel = cursorTakenOver ? t("关闭接管Cursor") : t("开启接管Cursor");
   const pluginModels = configuredPluginModels(plugins);
+  const modelResults = new Map<string, CursorModelTestState>(modelTestResults);
+  for (const model of models) {
+    if (model.last_error !== null) {
+      modelResults.set(model.model_hash, { status: "error", error: model.last_error, atMs: model.last_error_at_ms });
+    }
+  }
+  for (const model of pluginModels) {
+    if (model.lastError !== null) {
+      modelResults.set(model.id, { status: "error", error: model.lastError, atMs: model.lastErrorAtMs });
+    }
+  }
   const testTargets = [
     ...models.map((model) => ({ model_hash: model.model_hash, display_name: model.display_name })),
     ...pluginModels.map((model) => ({ model_hash: model.id, display_name: model.displayName })),
@@ -180,10 +191,15 @@ export function CursorSettingsPage() {
         return "cancelled";
       }
       const error = errorText(cause);
-      setModelTestResults((current) => new Map(current).set(model.model_hash, { status: "error", error }));
+      setModelTestResults((current) => {
+        const next = new Map(current);
+        next.delete(model.model_hash);
+        return next;
+      });
       if (notify) message(t("连通性测试失败：{error}", { error }), { duration: 5000 });
       return "failure";
     } finally {
+      if (notify) await Promise.all([appStore.refreshModels(), appStore.refreshPlugins()]);
       if (activeModelTests.current.get(model.model_hash) === active) activeModelTests.current.delete(model.model_hash);
       setTestingModelHashes((current) => {
         const next = new Set(current);
@@ -222,6 +238,7 @@ export function CursorSettingsPage() {
           : t("连通性测试完成：成功 {successful}，失败 {failed}", { successful, failed }),
       { duration: failed === 0 && cancelled === 0 ? 2400 : 5000 });
     } finally {
+      await Promise.all([appStore.refreshModels(), appStore.refreshPlugins()]);
       setBatchTesting(false);
     }
   };
@@ -304,7 +321,7 @@ export function CursorSettingsPage() {
     grouping={grouping}
     disabled={cursorBusy || togglingModelEnabled}
     testingModelHashes={testingModelHashes}
-    testResults={modelTestResults}
+    testResults={modelResults}
     onTest={(model) => void testModel(model)}
     onEnabledChange={(model, enabled) => void setModelEnabled(model, enabled)}
     onEdit={openEdit}
@@ -334,7 +351,7 @@ export function CursorSettingsPage() {
     </div>
   </CursorCaGate></CursorCaProvider>;
 
-  const editorTestState = editing ? modelTestResults.get(editing.model_hash) : undefined;
+  const editorTestState = editing ? modelResults.get(editing.model_hash) : undefined;
   const editorTesting = Boolean(editing && testingModelHashes.has(editing.model_hash));
   const activeGroups = grouping === "provider" ? providerGroups : typeGroups;
   const pluginSectionHeight = pluginModels.length > 0 ? 60 + pluginModels.length * 56 : 0;

@@ -1,5 +1,7 @@
 //! Owns core-side persistence of plugin resources and model catalogs.
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use super::data::PluginDataStore;
 use crate::{Error, Result};
@@ -216,6 +218,8 @@ impl StoredModel {
 #[derive(Clone)]
 pub struct PluginStateStore {
     data: PluginDataStore,
+    // 同一供应商的模型共用 JSON 文件，读改写必须串行，避免批量测试互相覆盖。
+    model_writes: Arc<Mutex<()>>,
 }
 
 pub struct UpsertOutcome {
@@ -225,7 +229,10 @@ pub struct UpsertOutcome {
 
 impl PluginStateStore {
     pub fn new(data: PluginDataStore) -> Self {
-        Self { data }
+        Self {
+            data,
+            model_writes: Arc::new(Mutex::new(())),
+        }
     }
 
     pub async fn resources(
@@ -341,6 +348,7 @@ impl PluginStateStore {
         provider_id: &str,
         models: &[StoredModel],
     ) -> Result<()> {
+        let _write = self.model_writes.lock().await;
         let previous = self.models(plugin_id, provider_id).await?;
         let models = models
             .iter()
@@ -370,16 +378,17 @@ impl PluginStateStore {
         model_id: &str,
         enabled: bool,
     ) -> Result<()> {
+        let _write = self.model_writes.lock().await;
         let mut models = self.models(plugin_id, provider_id).await?;
         let model = models
             .iter_mut()
             .find(|model| model.id == model_id)
             .ok_or_else(|| Error::RunNotFound(format!("plugin model {model_id}")))?;
-        model.enabled = enabled;
-        if enabled {
+        if enabled && !model.enabled {
             model.last_error = None;
             model.last_error_at_ms = None;
         }
+        model.enabled = enabled;
         self.data
             .update(
                 plugin_id,
@@ -396,17 +405,44 @@ impl PluginStateStore {
         model_id: &str,
         error: &str,
     ) -> Result<bool> {
+        self.update_model_error(plugin_id, provider_id, model_id, Some(error), true)
+            .await
+    }
+
+    pub async fn set_model_error(
+        &self,
+        plugin_id: &str,
+        provider_id: &str,
+        model_id: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.update_model_error(plugin_id, provider_id, model_id, error, false)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_model_error(
+        &self,
+        plugin_id: &str,
+        provider_id: &str,
+        model_id: &str,
+        error: Option<&str>,
+        disable: bool,
+    ) -> Result<bool> {
+        let _write = self.model_writes.lock().await;
         let mut models = self.models(plugin_id, provider_id).await?;
         let model = models
             .iter_mut()
             .find(|model| model.id == model_id)
             .ok_or_else(|| Error::RunNotFound(format!("plugin model {model_id}")))?;
-        if !model.enabled {
+        if disable && !model.enabled {
             return Ok(false);
         }
-        model.enabled = false;
-        model.last_error = Some(error.to_owned());
-        model.last_error_at_ms = Some(now_ms());
+        if disable {
+            model.enabled = false;
+        }
+        model.last_error = error.map(str::to_owned);
+        model.last_error_at_ms = error.map(|_| now_ms());
         self.data
             .update(
                 plugin_id,
@@ -563,5 +599,43 @@ mod tests {
         assert!(reenabled[0].enabled);
         assert!(reenabled[0].last_error.is_none());
         assert!(reenabled[0].last_error_at_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_model_errors_survive_catalog_sync_and_clear_independently() {
+        let (_root, store) = store();
+        let models = ["model-a", "model-b"].map(|id| {
+            StoredModel::from_definition(&serde_json::json!({"id": id, "displayName": id})).unwrap()
+        });
+        store
+            .replace_models("dev.example", "codex", &models)
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            store.set_model_error("dev.example", "codex", "model-a", Some("error a")),
+            store.set_model_error("dev.example", "codex", "model-b", Some("error b")),
+        );
+        first.unwrap();
+        second.unwrap();
+        store
+            .replace_models("dev.example", "codex", &models)
+            .await
+            .unwrap();
+        let failed = store.models("dev.example", "codex").await.unwrap();
+        assert!(failed
+            .iter()
+            .all(|model| model.enabled && model.last_error_at_ms.is_some()));
+        assert_eq!(failed[0].last_error.as_deref(), Some("error a"));
+        assert_eq!(failed[1].last_error.as_deref(), Some("error b"));
+        store
+            .set_model_error("dev.example", "codex", "model-a", None)
+            .await
+            .unwrap();
+        let cleared = store.models("dev.example", "codex").await.unwrap();
+        assert!(cleared[0].enabled);
+        assert!(cleared[0].last_error.is_none());
+        assert!(cleared[0].last_error_at_ms.is_none());
+        assert_eq!(cleared[1].last_error, failed[1].last_error);
+        assert_eq!(cleared[1].last_error_at_ms, failed[1].last_error_at_ms);
     }
 }

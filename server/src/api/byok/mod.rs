@@ -372,23 +372,10 @@ async fn handle_model_failure(
 }
 
 pub(super) async fn disable_failed_model(store: &Store, model_hash: &str, error: impl AsRef<str>) {
-    let mut message = error.as_ref().to_owned();
-    if let Ok(Some(model)) = store.model(model_hash).await {
-        if model.api_key.len() >= 12 {
-            message = message.replace(&model.api_key, "[redacted]");
-        }
-        if let Some(headers) = model.custom_headers.as_object() {
-            for (name, value) in headers {
-                if crate::model::is_sensitive_header(name) {
-                    if let Some(secret) = value.as_str().filter(|value| value.len() >= 12) {
-                        message = message.replace(secret, "[redacted]");
-                    }
-                }
-            }
-        }
-    }
-    let message = message.chars().take(2000).collect::<String>();
-    if let Err(disable_error) = store.disable_model_with_error(model_hash, &message).await {
+    if let Err(disable_error) = store
+        .disable_model_with_error(model_hash, error.as_ref())
+        .await
+    {
         tracing::warn!(model_hash, %disable_error, "failed to disable unavailable model");
     }
 }
@@ -399,12 +386,12 @@ pub(super) async fn disable_failed_model_or_plugin(
     model_id: &str,
     error: impl AsRef<str>,
 ) {
-    let message = error.as_ref().chars().take(2000).collect::<String>();
+    let message = error.as_ref();
     if crate::plugin::parse_model_id(model_id).is_some() {
-        if let Err(disable_error) = plugins.disable_model_with_error(model_id, &message).await {
+        if let Err(disable_error) = plugins.disable_model_with_error(model_id, message).await {
             tracing::warn!(model_id, %disable_error, "failed to disable unavailable plugin model");
         }
     } else {
-        disable_failed_model(store, model_id, &message).await;
+        disable_failed_model(store, model_id, message).await;
     }
 }

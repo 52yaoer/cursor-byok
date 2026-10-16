@@ -82,6 +82,95 @@ async fn setup() -> (
 }
 
 #[tokio::test]
+async fn model_tests_persist_failures_without_changing_enabled_state() {
+    let (router, provider, store, _directory) = setup().await;
+    let model = store.models().await.unwrap().remove(0);
+    for enabled in [true, false] {
+        if !enabled {
+            store
+                .disable_model_with_error(&model.model_hash, "older invocation error")
+                .await
+                .unwrap();
+        }
+        provider.push_error(Error::Provider("latest connectivity error".into()));
+        let (status, _) = send(
+            router.clone(),
+            "POST",
+            &format!(
+                "/__byok-api__/api/models/{}/test/failure-{enabled}",
+                model.model_hash
+            ),
+            None,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let failed = store.model(&model.model_hash).await.unwrap().unwrap();
+        assert_eq!(failed.enabled, enabled);
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some("provider error: latest connectivity error")
+        );
+        assert!(failed.last_error_at_ms.is_some());
+    }
+}
+
+#[tokio::test]
+async fn model_tests_clear_old_errors_on_success_without_enabling_model() {
+    let (router, provider, store, _directory) = setup().await;
+    let model = store.models().await.unwrap().remove(0);
+    store
+        .disable_model_with_error(&model.model_hash, "older invocation error")
+        .await
+        .unwrap();
+    provider.push(vec![
+        ModelEvent::TextDelta("1 2 3".into()),
+        ModelEvent::Done(FinishReason::Stop),
+    ]);
+    let (status, body) = send(
+        router,
+        "POST",
+        &format!("/__byok-api__/api/models/{}/test/success", model.model_hash),
+        None,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tested = store.model(&model.model_hash).await.unwrap().unwrap();
+    assert!(!tested.enabled);
+    assert!(tested.last_error.is_none());
+    assert!(tested.last_error_at_ms.is_none());
+}
+
+#[tokio::test]
+async fn model_tests_preserve_old_errors_when_cancelled() {
+    let (router, provider, store, _directory) = setup().await;
+    let model = store.models().await.unwrap().remove(0);
+    store
+        .disable_model_with_error(&model.model_hash, "older invocation error")
+        .await
+        .unwrap();
+    let before = store.model(&model.model_hash).await.unwrap().unwrap();
+    let path = format!(
+        "/__byok-api__/api/models/{}/test/cancelled",
+        model.model_hash
+    );
+    assert_eq!(
+        send(router.clone(), "DELETE", &path, None, json!({}))
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    provider.push(vec![ModelEvent::Done(FinishReason::Stop)]);
+    let (status, _) = send(router, "POST", &path, None, json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let after = store.model(&model.model_hash).await.unwrap().unwrap();
+    assert_eq!(after.last_error, before.last_error);
+    assert_eq!(after.last_error_at_ms, before.last_error_at_ms);
+    assert!(!after.enabled);
+}
+
+#[tokio::test]
 async fn management_settings_enable_the_external_route_without_restart() {
     let (router, _provider, _store, _directory) = setup().await;
     let (status, body) = send(

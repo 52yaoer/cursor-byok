@@ -124,6 +124,7 @@ impl Store {
             .ok_or_else(|| Error::RunNotFound(format!("model {current_hash}")))?;
         let input = normalize_model_input(input)?;
         let next_hash = model_hash(&input)?;
+        let clear_error = (!current.enabled && input.enabled) || next_hash != current.model_hash;
         let now = now_ms();
         let _write = self.writes.lock().await;
         let mut transaction = self.pool.begin().await?;
@@ -171,8 +172,8 @@ impl Store {
         .bind(&input.anthropic_thinking_effort)
         .bind(input.thinking_budget_tokens.map(to_i64).transpose()?)
         .bind(now)
-        .bind(input.enabled)
-        .bind(input.enabled)
+        .bind(clear_error)
+        .bind(clear_error)
         .bind(current_hash)
         .execute(&mut *transaction)
         .await?;
@@ -205,15 +206,51 @@ impl Store {
     }
 
     pub async fn disable_model_with_error(&self, hash: &str, error: &str) -> Result<bool> {
+        self.update_model_error(hash, Some(error), true).await
+    }
+
+    pub async fn set_model_error(&self, hash: &str, error: Option<&str>) -> Result<()> {
+        self.update_model_error(hash, error, false).await?;
+        Ok(())
+    }
+
+    async fn update_model_error(
+        &self,
+        hash: &str,
+        error: Option<&str>,
+        disable: bool,
+    ) -> Result<bool> {
+        let model = self
+            .model(hash)
+            .await?
+            .ok_or_else(|| Error::RunNotFound(format!("model {hash}")))?;
+        let message = error.map(|error| {
+            let mut message = error.to_owned();
+            if model.api_key.len() >= 12 {
+                message = message.replace(&model.api_key, "[redacted]");
+            }
+            if let Some(headers) = model.custom_headers.as_object() {
+                for (name, value) in headers {
+                    if crate::model::is_sensitive_header(name) {
+                        if let Some(secret) = value.as_str().filter(|value| value.len() >= 12) {
+                            message = message.replace(secret, "[redacted]");
+                        }
+                    }
+                }
+            }
+            message.chars().take(2000).collect::<String>()
+        });
         let _write = self.writes.lock().await;
         let now = now_ms();
         let result = sqlx::query(
-            "UPDATE model_configs SET enabled = 0, last_error = ?, last_error_at_ms = ?, updated_at_ms = ? WHERE model_hash = ? AND enabled = 1",
+            "UPDATE model_configs SET enabled = CASE WHEN ? THEN 0 ELSE enabled END, last_error = ?, last_error_at_ms = ?, updated_at_ms = ? WHERE model_hash = ? AND (? = 0 OR enabled = 1)",
         )
-        .bind(error)
-        .bind(now)
+        .bind(disable)
+        .bind(&message)
+        .bind(message.as_ref().map(|_| now))
         .bind(now)
         .bind(hash)
+        .bind(disable)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -460,6 +497,50 @@ mod tests {
         assert!(reenabled.enabled);
         assert!(reenabled.last_error.is_none());
         assert!(reenabled.last_error_at_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn model_errors_are_redacted_and_survive_unrelated_edits_and_reopening() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", directory.path().join("test.db").display());
+        let store = Store::connect(&url).await.unwrap();
+        let mut input = model_input(None);
+        input.api_key = "synthetic-api-key-for-test".into();
+        input.custom_headers_enabled = true;
+        input.custom_headers = serde_json::json!({"Authorization": "synthetic-header-for-test"});
+        let model = store.create_model(&input).await.unwrap();
+        store
+            .set_model_error(
+                &model.model_hash,
+                Some("HTTP 502 synthetic-api-key-for-test synthetic-header-for-test"),
+            )
+            .await
+            .unwrap();
+        let failed = store.model(&model.model_hash).await.unwrap().unwrap();
+        assert!(failed.enabled);
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some("HTTP 502 [redacted] [redacted]")
+        );
+        assert!(failed.last_error_at_ms.is_some());
+
+        input.group_name = Some("Renamed group".into());
+        let edited = store.update_model(&model.model_hash, &input).await.unwrap();
+        assert_eq!(edited.last_error, failed.last_error);
+        assert_eq!(edited.last_error_at_ms, failed.last_error_at_ms);
+        drop(store);
+        let store = Store::connect(&url).await.unwrap();
+        let loaded = store.model(&model.model_hash).await.unwrap().unwrap();
+        assert_eq!(loaded.last_error, failed.last_error);
+        assert_eq!(loaded.last_error_at_ms, failed.last_error_at_ms);
+        store
+            .set_model_error(&model.model_hash, None)
+            .await
+            .unwrap();
+        let cleared = store.model(&model.model_hash).await.unwrap().unwrap();
+        assert!(cleared.enabled);
+        assert!(cleared.last_error.is_none());
+        assert!(cleared.last_error_at_ms.is_none());
     }
 
     /// 分组名是纯展示字段:入库时去除首尾空白、空串归一为 NULL,

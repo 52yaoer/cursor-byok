@@ -331,6 +331,18 @@ impl ControlService {
             .lock()
             .expect("model test registry mutex poisoned")
             .remove(test_id);
+        if !matches!(result, Err(Error::Cancelled)) {
+            let error = result.as_ref().err().map(ToString::to_string);
+            if model_hash.starts_with(crate::plugin::ADAPTER_ID_PREFIX) {
+                self.plugins
+                    .set_model_error(model_hash, error.as_deref())
+                    .await?;
+            } else {
+                self.store
+                    .set_model_error(model_hash, error.as_deref())
+                    .await?;
+            }
+        }
         result
     }
 

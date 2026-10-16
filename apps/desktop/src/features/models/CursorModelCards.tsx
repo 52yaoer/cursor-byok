@@ -171,7 +171,7 @@ function ModelListRow({ model, disabled, testing, result, onTest, onEnabledChang
       <span className={styles.modelRowNameText}>{model.display_name}</span>
       <span className={styles.modelRowModelId}>{model.model_id}</span>
     </div>
-    <CursorModelTestResult compact state={result} testing={testing} autoDisabledError={model.last_error ?? undefined} />
+    <CursorModelTestResult compact state={result} testing={testing} />
     <div className={styles.modelCardActions}>
       <Switch checked={model.enabled} disabled={disabled} label={t("启用 {model}", { model: model.display_name })} onChange={onEnabledChange} />
       <TruncatedButton size="small" disabled={disabled && !testing} label={testing ? t("取消测试") : t("测试")} onClick={onTest} />
@@ -196,7 +196,7 @@ function PluginModelRow({ model, disabled, testing, result, onTest, onEnabledCha
       <span className={styles.modelRowNameText}>{model.displayName}</span>
       <span className={styles.modelRowModelId}>{model.modelId}</span>
     </div>
-    <CursorModelTestResult compact state={result} testing={testing} autoDisabledError={model.lastError ?? undefined} />
+    <CursorModelTestResult compact state={result} testing={testing} />
     <div className={styles.modelCardActions}>
       <Switch checked={model.enabled} disabled={disabled} label={t("启用 {model}", { model: model.displayName })} onChange={onEnabledChange} />
       <TruncatedButton size="small" disabled={disabled && !testing} label={testing ? t("取消测试") : t("测试")} onClick={onTest} />
@@ -288,7 +288,7 @@ function ModelGrid({
             </span>
           </div>
           <div className={styles.modelCardTest}>
-            <CursorModelTestResult state={result} testing={testing} autoDisabledError={model.last_error ?? undefined} />
+            <CursorModelTestResult state={result} testing={testing} />
           </div>
           <div className={styles.modelCardActions}>
             <Switch checked={model.enabled} disabled={disabled} label={t("启用 {model}", { model: model.display_name })} onChange={(enabled) => onEnabledChange(model, enabled)} />
