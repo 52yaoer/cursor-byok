@@ -7,7 +7,7 @@ mod protocol;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -22,6 +22,8 @@ use crate::{
 
 use self::protocol::Protocol;
 pub use direct::NativeForwarder;
+
+const EXTERNAL_API_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 struct ApiState {
@@ -43,6 +45,7 @@ pub fn router(
         .route("/byok/v1/chat/completions", post(chat))
         .route("/byok/v1/responses", post(responses))
         .route("/byok/v1/messages", post(messages))
+        .route_layer(DefaultBodyLimit::max(EXTERNAL_API_BODY_LIMIT))
         .with_state(ApiState {
             store,
             plugins,

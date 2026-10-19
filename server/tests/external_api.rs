@@ -326,6 +326,38 @@ async fn responses_accept_the_configured_model_id_without_a_group() {
 }
 
 #[tokio::test]
+async fn responses_accept_request_bodies_larger_than_axum_default_limit() {
+    let (router, provider, store, _directory) = setup().await;
+    let mut input = model_input();
+    input.model_id = "gpt-6.1-sol".into();
+    input.openai_endpoint = OPENAI_RESPONSES_ENDPOINT.into();
+    store.create_model(&input).await.unwrap();
+    store
+        .set_external_api_settings(ExternalApiSettings {
+            enabled: true,
+            api_key: "secret".into(),
+        })
+        .await
+        .unwrap();
+    provider.push(vec![
+        ModelEvent::TextDelta("ok".into()),
+        ModelEvent::Done(FinishReason::Stop),
+    ]);
+
+    let large_input = "x".repeat(2 * 1024 * 1024 + 1);
+    let (status, body) = send(
+        router,
+        "POST",
+        "/byok/v1/responses",
+        Some("secret"),
+        json!({"model":"gpt-6.1-sol","input":large_input}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
 async fn disabled_models_are_excluded_until_reenabled() {
     let (router, provider, store, _directory) = setup().await;
     let first = store.models().await.unwrap().remove(0);
